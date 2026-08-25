@@ -48,35 +48,46 @@ confirming that a pure static (gravity-only) torque deficit is *not* fixable by
 retiming, only by reshaping/rerouting/braking, which is what the paper's own
 Level-1 discussion implies should happen.
 
-All six of `experiments/exp1_baseline.py` through `exp6_severity_sweep.py` are
-now implemented and runnable, with results below from an actual run (not
-fabricated -- rerun `run_all.py` to reproduce). Getting Exp 3/4 correct required
-extending the force interface from a constant `(2,)` value to a callable
-`ee_force_fn(t, q) -> force`, since Exp 3 needs a purely time-based schedule
-(ramp onset) while Exp 4 needs a *position*-based one (a contact force that
-depends on where the end-effector actually is, which depends on which reference
-is currently active); `local_planner.py`'s `plan_route` vs. `online_step` split
-also governs whether B3's certificate gets to see that force schedule in full at
-planning time (`force_known_at_plan_time=True`, Exp 4: a known upcoming contact
+All six of `experiments/exp1_baseline.py` through `exp6_severity_sweep.py`, plus
+`experiments/ablation_batch.py` (A1-A5, Sec. VIII-H), are implemented and
+runnable, with results below from an actual run (not fabricated -- rerun
+`run_all.py` to reproduce). Getting Exp 3/4 correct required extending the force
+interface from a constant `(2,)` value to a callable `ee_force_fn(t, q) ->
+force`, since Exp 3 needs a purely time-based schedule (ramp onset) while Exp 4
+needs a *position*-based one (a contact force that depends on where the
+end-effector actually is, which depends on which reference is currently
+active); `local_planner.py`'s `plan_route` vs. `online_step` split also governs
+whether B3's certificate gets to see that force schedule in full at planning
+time (`force_known_at_plan_time=True`, Exp 4: a known upcoming contact
 transition) or only within the bounded online prediction horizon as it comes
 into view (Exp 3: an unanticipated disturbance -- this is what gives "detection
 lead time" a real, horizon-bounded meaning instead of oracle knowledge). The
-ablation sweep (A1-A5, Sec. VIII-H) is still just `PlannerConfig` flag
-combinations away but has not been scripted as a batch. Real-time per-cycle
-timing (Sec. VIII-J) has not been measured.
+ablation batch needed one more addition: `PlannerConfig.allow_level4`, since A4
+("Levels 0-2 only; Level 3/4 disabled") couldn't previously be expressed --
+Level 4's brake fallback was unconditional. Real-time per-cycle timing
+(Sec. VIII-J) has not been measured.
 
 ## Real results from the current implementation
 
 - **Exp 1 (no-regression check):** B1/B2/B3 are bit-for-bit identical on a benign
   trajectory (0.3 mm final error, no saturation) -- no regression from adding the
   predictive layer when it isn't needed.
-- **Exp 2 (payload sweep, same geometry+timing):** B1/B2 first saturate at 2.0 kg
-  payload and fail the task outright by 3.0 kg. B3 also shows its first
-  saturation event at 2.0 kg but, via Level-1 retiming, still **completes the
-  task successfully at 3.0 kg where B1/B2 both fail** -- a genuine, task-level
-  win, not just a torque-margin number. Conservatism over this sweep: 0/9
-  triggers were false positives (every trigger corresponded to a real violation
-  of the unmodified nominal trajectory).
+- **Exp 2 (payload sweep, same geometry+timing):** B1/B2/B3 all first saturate at
+  2.0 kg payload. An earlier draft of this README claimed B3 uniquely completes
+  the task at 3.0 kg where B1/B2 both fail -- **that was wrong**, caught by
+  rerunning at finer payload resolution: by 3.0 kg *all three*, including B3,
+  fail the task (117-190 mm final error). The real, verified crossover is at
+  2.4 kg, and even there the honest picture is narrower than first claimed: B1
+  fails (34.8 mm error) but **B2 also succeeds** (not just B3) -- B2's simple
+  reactive throttle is just as capable as B3's predictive retiming in this
+  specific scenario, so this sweep does not by itself demonstrate B3 beating
+  B2. A further surprise turned up while checking this: at 2.6-3.0 kg, **B3 is
+  actually worse than B1** (e.g. 189.6 mm vs. 117.2 mm error at 3.0 kg) --
+  partial Level-1 retiming that can't fully restore margin apparently leaves
+  the arm in a worse tracking state than doing nothing, an unflattering but
+  real finding, reported rather than smoothed over. Conservatism over the full
+  sweep: 0/13 triggers were false positives (every trigger corresponded to a
+  real violation of the unmodified nominal trajectory).
 - **Exp 3 (interaction force, detection lead time):** a downward push (ramp onset
   at t=0.35s, held at -55N) is applied to a moderate-payload trajectory. Ground-
   truth failure of the unmodified nominal trajectory occurs at t=0.90s. B2 (no
@@ -113,6 +124,21 @@ timing (Sec. VIII-J) has not been measured.
   these experiments. That would need a scenario engineered so retiming is
   provably insufficient but a *non-uniform* acceleration change is not -- not yet
   constructed here.
+- **Ablation batch A1-A5:** run on two scenarios chosen because they're known to
+  need different levels of the hierarchy. On Exp 2's 2.4 kg crossover
+  ("retime-suffices"): **A3 (predict, don't act) is bit-for-bit identical to A1
+  (no prediction at all)** -- same level trace, same 10 saturation events, same
+  failure -- a clean, exact confirmation that prediction alone has zero value
+  unless something acts on it. A2 and A4/A5 all succeed here (consistent with
+  Exp 2's finding above that this scenario doesn't separate reactive from
+  predictive handling). On Exp 5's flagship P_A/P_B scenario
+  ("reroute-required"): **A4 (predict + retime/reshape, no reroute or brake)
+  fails** -- it does trigger Level 2 reshaping (`levels=['0','2']`) but ends up
+  *worse* than doing nothing (41 saturation events vs. A1's 36) -- while **A5
+  (the full architecture) succeeds cleanly via Level 3, zero saturation
+  events**. This is exactly the isolation the paper's own Sec. VIII-H text asks
+  for: rerouting's marginal contribution, shown on the one scenario nothing
+  short of it can fix.
 
 ## Known simplifications (stated once, applies throughout)
 

@@ -45,6 +45,7 @@ class PlannerConfig:
     allow_level1: bool = True
     allow_level2: bool = True
     allow_level3: bool = True
+    allow_level4: bool = True
 
 
 @dataclass
@@ -173,12 +174,28 @@ class LocalPlanner:
         if not cfg.act:
             return PlanResult(0, Q, Qdot, Qddot, m0, m0, triggered=True)
 
+        best_effort = None
         if cfg.allow_level2:
             Qddot2 = self._try_reshape(Q, Qdot, forces)
             if Qddot2 is not None:
                 m2 = self.cert.m_phys(Q, Qdot, Qddot2, forces)
                 if m2 >= self.cert.m_safe:
                     return PlanResult(2, Q, Qdot, Qddot2, m0, m2, triggered=True)
+                best_effort = (Qddot2, m2)  # didn't fully restore margin, but is
+                                            # still the least-bad qddot profile
+                                            # found -- used only if Level 4 is
+                                            # also disabled (ablation A4), below.
+
+        if not cfg.allow_level4:
+            # A4 (Sec. VIII-H): prediction + adaptation, no rerouting AND no
+            # braking fallback. If Level 2 found no usable solution either,
+            # there is nothing left to do but continue with the nominal
+            # reference and accept whatever happens -- the point of this
+            # ablation is to show that failing without a safety net.
+            if best_effort is not None:
+                Qddot2, m2 = best_effort
+                return PlanResult(2, Q, Qdot, Qddot2, m0, m2, triggered=True)
+            return PlanResult(0, Q, Qdot, Qddot, m0, m0, triggered=True)
 
         Qk, Qdotk, Qddotk = self._brake_profile(Q[0], Qdot[0])
         ts_k = t0 + cfg.dt * np.arange(cfg.horizon_steps)

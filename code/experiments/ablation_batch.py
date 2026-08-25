@@ -1,0 +1,123 @@
+"""Ablation batch A1-A5 (Sec. VIII-H), all sharing LocalPlanner's single code
+path via PlannerConfig flags -- A2 is the one exception, since 'current-state
+saturation only' isn't a LocalPlanner configuration at all, it's the separate
+reactive mechanism in baselines.policy_b2 (Sec. VIII-A's B2), so A2 is run as
+policy_b2 directly rather than through the planner.
+
+  A1 -- no predictive feedback at all                  (== B1, policy_b1)
+  A2 -- current-state saturation only, no prediction    (== B2, policy_b2)
+  A3 -- predicts, but the response is never acted on    (predict=True, act=False)
+  A4 -- predicts + retimes/reshapes, but never reroutes
+        or brakes                                       (allow_level3=False, allow_level4=False)
+  A5 -- the full architecture                            (== B3, all levels on)
+
+Run across two scenarios chosen because they're known (from Exp2 and Exp5) to
+actually need different levels of the hierarchy to succeed, so the ablation
+differences are real rather than vacuous:
+  - "retime-suffices": Exp2's payload=3.0 point, where Level 1 alone is enough.
+  - "reroute-required": Exp5's flagship P_A/P_B scenario, where only Level 3
+    (rerouting) succeeds -- this is the scenario the paper's own Sec. VIII-H
+    text singles out as where A4 (no rerouting) should show degraded
+    performance relative to A5.
+"""
+import sys, os
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+import numpy as np
+
+from dynamics import Arm
+from certificate import Certificate
+from trajectory import JointTrajectory
+from local_planner import PlannerConfig
+from baselines import policy_b1, policy_b2, policy_b3
+from executor import rollout
+import metrics as M
+
+ABLATION_CFGS = {
+    "A1": None,  # handled specially: policy_b1
+    "A2": None,  # handled specially: policy_b2
+    "A3": PlannerConfig(predict=True, act=False),
+    "A4": PlannerConfig(predict=True, act=True, allow_level1=True, allow_level2=True,
+                         allow_level3=False, allow_level4=False),
+    "A5": PlannerConfig(predict=True, act=True, allow_level1=True, allow_level2=True,
+                         allow_level3=True, allow_level4=True),
+}
+
+
+def run_one(name, arm, traj, cert, goal_pos, alt_traj=None, duration=None):
+    if name == "A1":
+        pol = policy_b1(traj)
+    elif name == "A2":
+        pol = policy_b2(traj, arm)
+    else:
+        pol = policy_b3(traj, arm, cert, ABLATION_CFGS[name], alt_traj=alt_traj)
+    rr = rollout(arm, pol, traj.q0, np.zeros(3), duration=duration, dt=0.02)
+    m = M.compute(rr, goal_pos)
+    levels = sorted(set(str(l) for l in rr.levels))
+    return m, levels
+
+
+def scenario_retime_suffices():
+    """Exp2's payload=2.4 point -- the actual task-success crossover in that
+    sweep (not 3.0kg, an earlier draft of this script/README got that wrong;
+    by 3.0kg every baseline, including the full architecture, already fails).
+    B1 (no prediction) fails here; B2 (reactive) and B3/A5 (predictive+act,
+    via Level-1 retiming) both succeed -- this scenario does NOT differentiate
+    reactive from predictive handling, which is itself worth knowing rather
+    than papering over."""
+    Q0 = np.array([0.0, -0.5, -0.3]); QF = np.array([1.1, -1.0, 0.6]); T = 0.55
+    PAYLOAD = 2.4
+    print(f"\n--- Scenario: retime-suffices (payload={PAYLOAD} kg, T={T}s) ---")
+    for name in ABLATION_CFGS:
+        arm = Arm.create(); arm.set_payload_mass(PAYLOAD)
+        cert = Certificate(arm=arm, m_safe=2.0)
+        traj = JointTrajectory(Q0, QF, T=T)
+        goal = arm.ee_position(QF)
+        m, levels = run_one(name, arm, traj, cert, goal, duration=T + 0.3)
+        print(f"{name}: success={m.task_success}, levels={levels}, "
+              f"sat_events={m.saturation_events}, peak_tau_ratio={m.peak_torque_ratio:.2f}")
+
+
+def scenario_reroute_required():
+    """Exp5's flagship: P_A (outstretched, heavy payload) is only rescuable by
+    rerouting to P_B. A4 (no reroute) should fail here even though A5 succeeds."""
+    Q0 = np.array([0.2, -1.0, -0.6])
+    QF_A = np.array([1.1, -0.15, 0.1])
+    QF_B = np.array([0.75, -1.15, -0.55])
+    T_A, T_B, PAYLOAD = 0.7, 0.9, 4.5
+    print(f"\n--- Scenario: reroute-required (flagship P_A/P_B, payload={PAYLOAD} kg) ---")
+    for name in ABLATION_CFGS:
+        arm = Arm.create(); arm.set_payload_mass(PAYLOAD)
+        cert = Certificate(arm=arm, m_safe=2.0)
+        traj_A = JointTrajectory(Q0, QF_A, T=T_A)
+        traj_B = JointTrajectory(Q0, QF_B, T=T_B)
+        alt = traj_B if name in ("A4", "A5") else None  # A1/A2/A3 have no route
+                                                          # switching in their
+                                                          # own definitions
+        goal_A = arm.ee_position(QF_A)
+        goal_B = arm.ee_position(QF_B)
+        m_probe_duration = max(T_A, T_B) + 0.3
+
+        if name == "A1":
+            pol = policy_b1(traj_A)
+        elif name == "A2":
+            pol = policy_b2(traj_A, arm)
+        else:
+            pol = policy_b3(traj_A, arm, cert, ABLATION_CFGS[name], alt_traj=alt)
+        rr = rollout(arm, pol, Q0, np.zeros(3), duration=m_probe_duration, dt=0.02)
+        err_A = np.linalg.norm(rr.ee_positions[-1] - goal_A)
+        err_B = np.linalg.norm(rr.ee_positions[-1] - goal_B)
+        m = M.compute(rr, goal_A if err_A < err_B else goal_B)
+        levels = sorted(set(str(l) for l in rr.levels))
+        reached = "A" if err_A < err_B else "B"
+        print(f"{name}: success={m.task_success} (reached {reached}), levels={levels}, "
+              f"sat_events={m.saturation_events}, peak_tau_ratio={m.peak_torque_ratio:.2f}")
+
+
+def run():
+    scenario_retime_suffices()
+    scenario_reroute_required()
+
+
+if __name__ == "__main__":
+    run()

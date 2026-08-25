@@ -19,7 +19,10 @@ import metrics as M
 Q0 = np.array([0.0, -0.5, -0.3])
 QF = np.array([1.1, -1.0, 0.6])
 T = 0.55  # fast enough that heavy payloads actually saturate
-PAYLOADS = [0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0]
+# Finer resolution around 2-3 kg: that's where B1/B3 task success actually
+# diverges (see README) -- integer-only steps previously missed it and made an
+# inaccurate claim about where B3 wins.
+PAYLOADS = [0.0, 1.0, 2.0, 2.2, 2.4, 2.6, 2.8, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0]
 
 
 def run():
