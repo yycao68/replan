@@ -129,8 +129,16 @@ def _run_scenario(scenario_name, Q0, QF, T, payload, alt_traj_fn=None, repeats=5
     # Diagnostic: if the online step is expensive, is it the Level-2 QP
     # (cvxpy/OSQP problem construction+solve, rebuilt from scratch every call)?
     # Rerun (once -- this is a diagnostic, not the headline number) with
-    # Level 2 disabled to isolate its contribution.
-    if stats_with["mean_ms"] > 1.0:
+    # Level 2 disabled to isolate its contribution. Gated on MAX, not mean:
+    # since Level 4 is sticky (baselines.py), a scenario that hits Level 4
+    # typically pays the expensive QP on only one cycle per rollout, which
+    # dilutes the mean below any reasonable fixed threshold (observed
+    # directly: mean fluctuated either side of a mean>1.0 gate run to run,
+    # depending on how many of the `repeats` rollouts happened to need the
+    # QP at all, making the diagnostic silently vanish on some runs even
+    # though the underlying per-solve cost was unchanged) -- max instead
+    # reliably reflects "did an expensive call happen at all."
+    if stats_with["max_ms"] > 1.0:
         def make_b3_no_l2():
             arm = Arm.create(); arm.set_payload_mass(payload)
             traj = JointTrajectory(Q0, QF, T=T)

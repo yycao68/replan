@@ -14,7 +14,9 @@ policy_b2 directly rather than through the planner.
 Run across two scenarios chosen because they're known (from Exp2 and Exp5) to
 actually need different levels of the hierarchy to succeed, so the ablation
 differences are real rather than vacuous:
-  - "retime-suffices": Exp2's payload=3.0 point, where Level 1 alone is enough.
+  - "retime-suffices": Exp2's payload=2.4 point, where Level 1 alone is enough
+    (see scenario_retime_suffices' docstring below for why not 3.0 -- an
+    earlier draft used that value and it was wrong).
   - "reroute-required": Exp5's flagship P_A/P_B scenario, where only Level 3
     (rerouting) succeeds -- this is the scenario the paper's own Sec. VIII-H
     text singles out as where A4 (no rerouting) should show degraded

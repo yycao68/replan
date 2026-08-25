@@ -80,6 +80,68 @@ def test_static_gravity_deficit_defeats_retiming():
     print("OK: retiming correctly fails to fix a pure static gravity-torque deficit")
 
 
+def test_brake_profile_starts_from_q_actual_not_nominal_sample():
+    """Regression test for a real bug: online_step's Level-4 brake profile used
+    to start from the NOMINAL trajectory's sample at the current wall-clock
+    time (Q[0]) instead of the robot's true position, so it never actually
+    held still -- it kept crawling forward chasing the nominal plan. Passing
+    q_actual/qdot_actual must change the brake profile's starting point."""
+    arm, cert, traj = make_scenario(payload_kg=6.0, T=0.5)
+    cfg = PlannerConfig(allow_level1=False, allow_level2=False, allow_level3=False)
+    planner = LocalPlanner(arm, cert, cfg)
+
+    res_no_actual = planner.online_step(traj, t0=0.3)
+    assert res_no_actual.level == 4
+
+    # A q_actual far from the nominal trajectory's sample at t0=0.3 -- e.g. the
+    # robot stopped near its start pose instead of following the plan.
+    stuck_q = traj.q0.copy()
+    stuck_qdot = np.zeros(3)
+    res_stuck = planner.online_step(traj, t0=0.3, q_actual=stuck_q, qdot_actual=stuck_qdot)
+    assert res_stuck.level == 4
+    assert np.allclose(res_stuck.Q[0], stuck_q), (
+        f"brake profile should start at q_actual={stuck_q}, got {res_stuck.Q[0]}"
+    )
+    assert not np.allclose(res_no_actual.Q[0], res_stuck.Q[0]), (
+        "q_actual should actually change the brake target when it differs "
+        "from the nominal trajectory's own sample"
+    )
+    print("OK: Level-4 brake profile correctly starts from q_actual, not the nominal sample")
+
+
+def test_policy_b3_sticky_brake_holds_position_after_level4():
+    """Regression test for a real bug: once Level 4 held position correctly
+    (fixed above), the certificate could later swing back to 'feasible' against
+    the nominal trajectory's own un-overridden future samples and return a raw
+    nominal reference far from the robot's actual (stopped) position -- an
+    instantaneous jump that visibly destabilized the MuJoCo simulation (NaN/Inf
+    qacc). baselines.policy_b3 must make Level 4 sticky: once triggered, every
+    subsequent call holds at whatever q_actual is, never resuming the nominal
+    plan on its own."""
+    from baselines import policy_b3
+    arm, cert, traj = make_scenario(payload_kg=6.0, T=0.5)
+    cfg = PlannerConfig(allow_level1=False, allow_level2=False, allow_level3=False)
+    pol = policy_b3(traj, arm, cert, cfg)
+
+    q_stopped = np.array([0.3, -0.6, 0.1])
+    zero_qdot = np.zeros(3)
+    q_ref1, qdot_ref1, qddot_ref1, meta1 = pol(0.3, q_stopped, zero_qdot)
+    assert meta1["level"] == 4
+    assert np.allclose(q_ref1, q_stopped)
+    assert np.allclose(qdot_ref1, 0) and np.allclose(qddot_ref1, 0)
+
+    # Even at a much later wall-clock time (long past the nominal trajectory's
+    # own duration, where the un-overridden nominal sample would be far from
+    # q_stopped), the policy must still just hold -- not snap back.
+    q_ref2, qdot_ref2, qddot_ref2, meta2 = pol(5.0, q_stopped, zero_qdot)
+    assert meta2["level"] == 4
+    assert np.allclose(q_ref2, q_stopped), (
+        f"sticky brake should keep holding at {q_stopped}, got reference {q_ref2}"
+    )
+    assert np.allclose(qdot_ref2, 0) and np.allclose(qddot_ref2, 0)
+    print("OK: policy_b3's Level 4 is sticky -- holds position, never snaps back to the nominal plan")
+
+
 def test_reroute_switches_to_alt_route_when_primary_infeasible():
     arm = Arm.create()
     arm.set_payload_mass(4.0)
@@ -103,5 +165,7 @@ if __name__ == "__main__":
     test_reshape_qp_solves_online_and_respects_bounds()
     test_brake_profile_reduces_velocity()
     test_static_gravity_deficit_defeats_retiming()
+    test_brake_profile_starts_from_q_actual_not_nominal_sample()
+    test_policy_b3_sticky_brake_holds_position_after_level4()
     test_reroute_switches_to_alt_route_when_primary_infeasible()
     print("\nAll planner tests passed.")

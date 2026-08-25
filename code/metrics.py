@@ -15,8 +15,8 @@ class RunMetrics:
     peak_torque_ratio: float          # max(|tau_applied|/tau_max) actually reached
     saturation_events: int            # steps where clipping altered the command
     saturation_fraction: float
-    tracking_error_rms_m: float
-    tracking_error_peak_m: float
+    tracking_error_rms_rad: float     # joint-space |q - q_ref|, NOT task-space meters
+    tracking_error_peak_rad: float
     min_actuator_margin_nm: float     # ground-truth min margin actually realized
     replans: int
     level_counts: dict
@@ -50,8 +50,8 @@ def compute(rollout, goal_ee_pos: np.ndarray, pos_tol: float = 0.03) -> RunMetri
         peak_torque_ratio=peak_ratio,
         saturation_events=sat_events,
         saturation_fraction=sat_fraction,
-        tracking_error_rms_m=rms,
-        tracking_error_peak_m=peak,
+        tracking_error_rms_rad=rms,
+        tracking_error_peak_rad=peak,
         min_actuator_margin_nm=min_margin,
         replans=rollout.replans,
         level_counts=level_counts,

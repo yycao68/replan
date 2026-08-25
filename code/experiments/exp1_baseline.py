@@ -41,7 +41,7 @@ def run():
         results[name] = m
         print(f"{name}: success={m.task_success}, final_err={m.final_pos_error_m*1000:.2f}mm, "
               f"peak_tau_ratio={m.peak_torque_ratio:.2f}, sat_events={m.saturation_events}, "
-              f"track_rms={m.tracking_error_rms_m*1000:.2f}mm, replans={m.replans}")
+              f"track_rms={m.tracking_error_rms_rad*1000:.2f}mrad, replans={m.replans}")
     return results
 
 
