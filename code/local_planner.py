@@ -155,11 +155,44 @@ class LocalPlanner:
         traj: JointTrajectory,
         t0: float,
         ee_force_fn=None,
+        q_actual: Optional[np.ndarray] = None,
+        qdot_actual: Optional[np.ndarray] = None,
     ) -> PlanResult:
         """ee_force_fn(t, q) -> force or None, looked ahead only over this call's
         bounded horizon (cfg.horizon_steps * cfg.dt) -- this is what gives Exp 3's
         'detection lead time' a real, horizon-bounded meaning rather than oracle
-        full-schedule knowledge."""
+        full-schedule knowledge.
+
+        q_actual/qdot_actual, if given, are used for exactly ONE purpose: as
+        the starting point for Level 4's brake profile. They deliberately do
+        NOT touch the feasibility check (m0, still computed from the nominal
+        Q/Qdot) or what gets RETURNED as the commanded reference for Level 0/2
+        -- an earlier, broader version of this fix routed them into both of
+        those too, on the reasoning that a receding-horizon controller should
+        measure the true current state before predicting forward. That is
+        standard practice in general, but here it interacted badly with a
+        second, pre-existing gap: once the robot has genuinely diverged from
+        the nominal trajectory (which is the whole point of having braked),
+        the nominal trajectory's LATER samples (Q[1:], still un-overridden)
+        can be far from where continuing the plan from q_actual would
+        actually go, so the certificate can swing back to 'feasible' and
+        Level 0 gets returned with a raw nominal reference that is now far
+        from the robot's actual position -- an instantaneous reference jump
+        that made the closed loop go unstable (observed directly: MuJoCo
+        NaN/Inf qacc warnings and torque values around 1e13 in Exp 2's high-
+        payload rows). Properly resolving that would mean replanning a fresh
+        trajectory from the robot's actual state once it has diverged, which
+        this codebase does not do online (Level 1/3 are planning-time-only
+        decisions, Sec. V-C) -- out of scope for this fix. Scoping q_actual/
+        qdot_actual down to just the brake-profile start point avoids the
+        interaction entirely while still fixing the original, narrower bug:
+        without it, every subsequent cycle re-derived its brake target from
+        the NOMINAL trajectory's hypothetical position at the current
+        (still-advancing) wall-clock time, rather than from where the robot
+        had actually stopped -- so the 'brake' reference kept crawling
+        forward to chase the original plan instead of holding position,
+        defeating the entire point of Level 4 and inflating saturation events
+        for as long as the certificate kept re-triggering."""
         cfg = self.cfg
         Q, Qdot, Qddot = traj.sample_horizon(t0, cfg.dt, cfg.horizon_steps)
         ts = t0 + cfg.dt * np.arange(cfg.horizon_steps)
@@ -197,7 +230,9 @@ class LocalPlanner:
                 return PlanResult(2, Q, Qdot, Qddot2, m0, m2, triggered=True)
             return PlanResult(0, Q, Qdot, Qddot, m0, m0, triggered=True)
 
-        Qk, Qdotk, Qddotk = self._brake_profile(Q[0], Qdot[0])
+        brake_q0 = q_actual if q_actual is not None else Q[0]
+        brake_qdot0 = qdot_actual if qdot_actual is not None else Qdot[0]
+        Qk, Qdotk, Qddotk = self._brake_profile(brake_q0, brake_qdot0)
         ts_k = t0 + cfg.dt * np.arange(cfg.horizon_steps)
         forces_k = self._sample_forces(ts_k, Qk, ee_force_fn)
         mk = self.cert.m_phys(Qk, Qdotk, Qddotk, forces_k)

@@ -29,6 +29,29 @@ Run `python3 run_all.py` from this directory.
   applied retiming as an instantaneous per-cycle correction and it silently did
   nothing, because the position reference kept marching forward at the original
   pace while only qdot/qddot were locally scaled.
+
+  Level 4 had a second, related bug, found while investigating an "unexplained
+  non-monotonicity" this README used to flag in Exp 3/4 (see below): its brake
+  profile was starting from the NOMINAL trajectory's position at the current,
+  still-advancing wall-clock time rather than from where the robot had actually
+  stopped, so it never really held position -- it kept crawling forward to chase
+  the original plan. Fixed by passing the true `q_actual`/`qdot_actual` into
+  `online_step` for the brake profile specifically (not for Level 0/2's
+  returned reference -- an earlier, broader attempt at this routed the true
+  state into those too and broke tracking entirely, since Level 0's whole job
+  is to keep pulling toward the *nominal* reference, not "wherever the robot
+  currently is"). Fixing the brake itself then exposed a THIRD, previously
+  unreachable bug: once Level 4 genuinely holds position for a while, the
+  certificate can later swing back to "feasible" (checked against the nominal
+  trajectory's own, un-overridden samples) and return a raw nominal reference
+  that is now far from the robot's real position -- an instantaneous reference
+  jump that visibly destabilized the MuJoCo simulation (NaN/Inf qacc warnings,
+  torque values around 1e13). `baselines.policy_b3` now makes Level 4 *sticky*:
+  once triggered, the policy holds the robot at its actual position for the
+  rest of the rollout rather than going back to querying the planner, matching
+  the paper's own framing of Level 4 as a "terminal safe-set policy" -- there is
+  no automatic resume, that would need a fresh route decision (Level 3) or a
+  higher-level replan, and this codebase does not invoke either automatically.
 - `executor.py` / `baselines.py` -- B1 (no handling), B2 (reactive, current-
   instant-only clipping/throttling), B3 (the full predictive architecture, or an
   ablation of it via `PlannerConfig` flags) all share one computed-torque tracking
@@ -97,22 +120,47 @@ since only the latter is actually subject to the 20ms (50 Hz) real-time budget.
   at t=0.35s, held at -55N) is applied to a moderate-payload trajectory. Ground-
   truth failure of the unmodified nominal trajectory occurs at t=0.90s. B2 (no
   lookahead) first reacts at t=0.90s -- exactly at failure, T_warning=0.00s, as
-  the paper's own framing predicts. **B3 first detects at t=0.48s, T_warning=0.42s.**
-  All three still fail the task at this force magnitude (peak torque ratio 1.00
-  for all) -- an honest result: the primary claim here is the lead time itself,
-  not that early detection guarantees recovery at any severity. (A parameter
-  sweep confirms B3 *does* fully avoid failure at lower force magnitudes, e.g.
-  30N, but so do B1/B2 there -- not a differentiator -- and at intermediate
-  magnitudes, 37-40N, B3 does not reliably show fewer saturation events than
-  B1/B2 either; that non-monotonicity is not yet understood and is flagged as an
-  open item rather than smoothed over.)
+  the paper's own framing predicts. **B3 first detects at t=0.48s, T_warning=0.42s**
+  (unchanged by the Level-4 fix below -- detection timing is independent of
+  what happens afterward). All three still fail the task at this force
+  magnitude, but B3's *character* of failure changed once Level 4 was fixed to
+  actually hold position (see "What this is" above): saturation events dropped
+  from 39 to **20**, and tracking error against its own (now sensible, static)
+  reference collapsed from 671.78 mrad to **1.60 mrad** -- it isn't chasing a
+  moving target anymore, it's genuinely stopped. This README used to flag an
+  "unexplained non-monotonicity" here (B3 sometimes showing *more* saturation
+  events than B1/B2 at intermediate force magnitudes, 37-40N) as an open item.
+  It's now understood, via the same investigation that found the Level-4 bugs
+  above: at fmag=37N, B3 correctly holds position from t=0.68s once the force
+  is still ramping, but the force keeps rising after that (ramp completes at
+  t=1.25s and holds at full magnitude) -- and the STATIC holding torque at
+  whatever pose B3 happened to stop in can itself exceed the actuator limit
+  once the force reaches its full value, so the robot starts sliding under the
+  disturbance anyway, still commanding "hold" the entire time. B1/B2 never
+  stop moving and may pass through momentarily more favorable configurations
+  or clear the high-demand region before the force reaches full magnitude.
+  This is a genuine, physically real property of Level 4 as designed -- a
+  static hold provides no guaranteed robustness against a disturbance that
+  keeps growing past what CAN be held statically -- not a bug, and not
+  obviously fixable without either a smarter Level 4 that re-picks its holding
+  pose if the current one stops being tenable, or coupling it to Level 3
+  (reroute to a genuinely better configuration instead of freezing wherever
+  the trigger first fired). A parameter sweep still confirms B3 fully avoids
+  failure at low force magnitudes (<=25N, matching B1/B2 there -- not a
+  differentiator) and, past ~30N, B3 fails the task via a permanent hold
+  (Level 4 has no resume path) even at magnitudes B1/B2 still complete despite
+  transient saturation -- a real, honest safety-vs-completion trade-off, not
+  a strict win for either side.
 - **Exp 4 (contact-stiffness transition, known in advance):** a scripted contact
   force turns on once the end-effector descends past a virtual plane; unlike
   Exp 3, B3 is given this contact model at planning time. B2 (reactive) first
   responds only once already in contact, t=0.70s; **B3 responds at t=0.42s**,
-  before the transition, and finishes with **9 saturation events vs. 27-29 for
-  B1/B2** (a ~3x reduction), though again none of the three reach full task
-  success at this contact stiffness -- the same honest caveat as Exp 3.
+  before the transition, and -- after the Level-4 fix -- finishes with **zero
+  saturation events** (previously reported as 9, before Level 4 was fixed to
+  actually hold rather than crawl) **vs. 27-29 for B1/B2**. None of the three
+  reach full task success at this contact stiffness (B3 again holds
+  permanently once braked), but B3's own outcome is now unambiguously clean:
+  it detects early, stops, and never saturates again.
 - **Exp 5 (flagship):** P_A (outstretched pose under a 4.5 kg payload) saturates
   and fails under B1 and B2 (peak torque ratio 1.00, 36-37 saturation events).
   B3's certificate predicts the deficit before execution, reroutes to P_B, and
@@ -147,29 +195,36 @@ since only the latter is actually subject to the 20ms (50 Hz) real-time budget.
 - **Real-time timing benchmark (Sec. VIII-J):** on Exp 1's nominal trajectory,
   B3's online per-cycle step easily fits the 20ms/50Hz budget (mean 0.27ms, max
   under 0.5ms across repetitions) -- unsurprising, since Level 0 (do nothing)
-  is all it ever needs there. On **Exp 5's stress case (P_A), it does not**.
-  This finding needed a second pass to get right: a single rollout's max is
-  not trustworthy on a shared dev machine, since wall-clock latency is noisy
-  (one early run showed max=17.2ms, i.e. apparently fitting, until repeated
-  runs revealed that was the lucky outlier, not the typical case). The
-  benchmark now pools 5 independent repetitions: mean (~12ms) and p95
-  (~17.5ms) are stable and reproducible across repeats, both nominally under
-  budget on average, but **the per-repetition max is consistently over
-  budget** -- typically 40-90ms (2-4.5x budget) in 4 of 5 repeats, with an
-  occasional repeat closer to the boundary (~21-22ms) but never actually
-  under it in repeated testing. Disabling Level 2 drops the mean to ~0.4ms,
-  isolating the cause: the Level-2 QP (cvxpy/OSQP, which reconstructs the
-  optimization problem from scratch every single call rather than reusing a
-  compiled/parametrized form) accounts for **~97% of the online-step cost**
-  whenever it's actually being solved every cycle. This is a genuine, reported-
-  as-found limitation, not smoothed over: none of the simulated results above
-  are invalidated by it (this is offline simulation -- wall-clock Python cost
+  is all it ever needs there. On **Exp 5's stress case (P_A)**, the picture
+  changed with the Level-4 fix above, and the change itself is informative.
+  Before the fix, B3 kept failing to hold position and re-triggering the
+  expensive Level-2 QP essentially every cycle, which is what the earlier
+  version of this benchmark measured: a *sustained* load, mean ~12ms, p95
+  ~17.5ms, and a per-repetition max consistently over budget (40-90ms in most
+  repeats). After the fix, B3 hits Level 4 almost immediately and then holds
+  (sticky, no further QP calls) for the rest of the rollout, so the QP is now
+  solved just **once** per rollout instead of dozens of times: pooled over 5
+  repeats, mean drops to ~0.35ms and **p95 is ~0.002ms** (the overwhelming
+  majority of cycles are now the trivial sticky-hold branch), but **max is
+  still ~17-18ms** -- that one QP solve, wherever it lands, still costs what a
+  QP solve costs. This is a better-supported, more honest way to say the same
+  underlying thing the pre-fix number was pointing at: a single Level-2 QP
+  solve (cvxpy/OSQP, which reconstructs the optimization problem from scratch
+  every call rather than reusing a compiled/parametrized form) costs close to
+  the entire 20ms budget on its own, whether it happens once or fifty times.
+  The earlier repeated-QP measurements also showed real tail risk up to
+  40-90ms for a *single* solve under some conditions, so a lucky one-shot
+  ~17-18ms in this particular scenario should not be read as "safely under
+  budget" so much as "not the sustained problem it looked like before, but the
+  underlying per-solve cost is still a real risk on any single cycle it's
+  invoked." None of the simulated results elsewhere in this README are
+  invalidated by any of this (offline simulation -- wall-clock Python cost
   doesn't change what the physics/control-logic computed), but it does mean
-  this specific implementation, as written, would not meet a real 50Hz
-  hardware control loop under stress-case conditions without either a
-  parametrized/warm-started QP formulation (cvxpy supports this via
-  `Parameter`, not yet used here) or a lower online replan rate for Level 2
-  specifically.
+  this specific implementation, as written, would not safely meet a real 50Hz
+  hardware control loop on whichever cycle Level 2 actually engages, without
+  either a parametrized/warm-started QP formulation (cvxpy supports this via
+  `Parameter`, not yet used here) or accepting that cycle as a bounded,
+  planned-for overrun.
 
 ## Known simplifications (stated once, applies throughout)
 
@@ -179,4 +234,10 @@ docstring). `delta_tau` (Theorem 1's uncertainty bound) is a fixed 5% of
 `tau_max`, not estimated online. No collision/obstacle feasibility set is
 modeled (`F_obs` from the paper's Sec. III is out of scope here; only `F_dyn` is
 tested). Theorem 4 (recursive feasibility) is not attempted, consistent with the
-paper draft's own "deferred" framing.
+paper draft's own "deferred" framing. Level 4 (brake) is sticky and terminal:
+once engaged, `baselines.policy_b3` holds the robot at its stopped position for
+the rest of the rollout with no automatic resume (see "What this is" above) --
+this is a genuine, deliberate architectural limitation, not an oversight, but it
+means every result reported here where B3 reaches Level 4 is reporting a safety
+outcome (did it stop without violating limits), not a task-completion outcome
+(it never finishes the original plan once stopped).

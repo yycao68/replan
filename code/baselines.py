@@ -67,15 +67,39 @@ def policy_b3(
     full (Exp 4: a known upcoming contact transition is part of the 'predicted
     environment') or only the bounded online horizon sees it as it comes into
     view (Exp 3: an unanticipated disturbance, detected only within the online
-    prediction horizon -- see online_step's docstring)."""
+    prediction horizon -- see online_step's docstring).
+
+    Level 4 is STICKY: once online_step returns level 4, this policy holds the
+    robot at its actual position for the rest of the rollout rather than going
+    back to querying online_step (which would keep sampling the nominal
+    trajectory at the current, still-advancing wall-clock time -- once the
+    robot has been sitting still for a while, that nominal sample can be far
+    from the robot's real position, and returning it as a reference again
+    produces an instantaneous reference jump that destabilizes the closed
+    loop; this was found directly, as MuJoCo NaN/Inf qacc warnings, while
+    fixing Level 4's brake-profile starting point to use the true current
+    state instead of the nominal trajectory's -- see online_step's
+    docstring). This matches the paper's own Sec. V-B framing of Level 4 as a
+    'terminal safe-set policy': resuming the original plan after a genuine
+    stop would need a fresh route decision (Level 3) or a higher-level
+    replan, neither of which is invoked automatically here -- that is an
+    honest, stated limitation (README), not something this fix works around."""
     cfg = cfg or PlannerConfig()
     planner = LocalPlanner(arm, cert, cfg)
     route_force_fn = ee_force_schedule if force_known_at_plan_time else None
     route = planner.plan_route(traj, alt_traj=alt_traj, ee_force_fn=route_force_fn)
-    state = {"active_traj": route.traj, "route_level": route.level}
+    state = {"active_traj": route.traj, "route_level": route.level, "braked": False}
 
     def policy(t, q_actual, qdot_actual):
-        res = planner.online_step(state["active_traj"], t, ee_force_fn=ee_force_schedule)
+        if state["braked"]:
+            zeros = np.zeros_like(q_actual)
+            meta = {"level": 4, "m_phys": None, "m_phys_after": None, "replanned": True}
+            return q_actual, zeros, zeros, meta
+
+        res = planner.online_step(state["active_traj"], t, ee_force_fn=ee_force_schedule,
+                                   q_actual=q_actual, qdot_actual=qdot_actual)
+        if res.level == 4:
+            state["braked"] = True
         level = res.level if res.level != 0 else state["route_level"]
         replanned = res.level != 0 or state["route_level"] != 0
         meta = {
