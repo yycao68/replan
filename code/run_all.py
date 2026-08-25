@@ -6,7 +6,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from experiments import (
     exp1_baseline, exp2_payload_sweep, exp3_interaction_force,
     exp4_contact_stiffness_step, exp5_flagship_reroute, exp6_severity_sweep,
-    ablation_batch,
+    ablation_batch, timing_benchmark,
 )
 
 SECTIONS = [
@@ -18,6 +18,7 @@ SECTIONS = [
     ("Experiment 5: flagship reroute", exp5_flagship_reroute.run),
     ("Experiment 6: severity sweep across Level 0-4", exp6_severity_sweep.run),
     ("Ablation batch A1-A5", ablation_batch.run),
+    ("Real-time timing benchmark (Sec. VIII-J)", timing_benchmark.run),
 ]
 
 if __name__ == "__main__":

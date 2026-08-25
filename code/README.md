@@ -64,8 +64,13 @@ into view (Exp 3: an unanticipated disturbance -- this is what gives "detection
 lead time" a real, horizon-bounded meaning instead of oracle knowledge). The
 ablation batch needed one more addition: `PlannerConfig.allow_level4`, since A4
 ("Levels 0-2 only; Level 3/4 disabled") couldn't previously be expressed --
-Level 4's brake fallback was unconditional. Real-time per-cycle timing
-(Sec. VIII-J) has not been measured.
+Level 4's brake fallback was unconditional.
+
+`experiments/timing_benchmark.py` (Sec. VIII-J) measures wall-clock per-cycle
+computation time directly, wrapping each baseline's policy call with
+`time.perf_counter()` -- B3's ONE-TIME route-planning cost (Level 1/3, a whole-
+route search) is timed separately from its PER-CYCLE online cost (Level 0/2/4),
+since only the latter is actually subject to the 20ms (50 Hz) real-time budget.
 
 ## Real results from the current implementation
 
@@ -139,6 +144,23 @@ Level 4's brake fallback was unconditional. Real-time per-cycle timing
   events**. This is exactly the isolation the paper's own Sec. VIII-H text asks
   for: rerouting's marginal contribution, shown on the one scenario nothing
   short of it can fix.
+- **Real-time timing benchmark (Sec. VIII-J):** on Exp 1's nominal trajectory,
+  B3's online per-cycle step easily fits the 20ms/50Hz budget (mean 0.26ms, max
+  0.33ms) -- unsurprising, since Level 0 (do nothing) is all it ever needs
+  there. On **Exp 5's stress case (P_A), it does not**: mean 11.9ms, p95
+  17.6ms, **max 22.3ms -- over budget**. Disabling Level 2 drops the mean to
+  0.4ms, isolating the cause: the Level-2 QP (cvxpy/OSQP, which reconstructs
+  the optimization problem from scratch every single call rather than reusing
+  a compiled/parametrized form) accounts for **~97% of the online-step cost**
+  whenever it's actually being solved every cycle. This is a genuine, reported-
+  as-found limitation, not smoothed over: none of the simulated results above
+  are invalidated by it (this is offline simulation -- wall-clock Python cost
+  doesn't change what the physics/control-logic computed), but it does mean
+  this specific implementation, as written, would not meet a real 50Hz
+  hardware control loop under stress-case conditions without either a
+  parametrized/warm-started QP formulation (cvxpy supports this via
+  `Parameter`, not yet used here) or a lower online replan rate for Level 2
+  specifically.
 
 ## Known simplifications (stated once, applies throughout)
 
