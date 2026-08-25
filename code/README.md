@@ -145,13 +145,22 @@ since only the latter is actually subject to the 20ms (50 Hz) real-time budget.
   for: rerouting's marginal contribution, shown on the one scenario nothing
   short of it can fix.
 - **Real-time timing benchmark (Sec. VIII-J):** on Exp 1's nominal trajectory,
-  B3's online per-cycle step easily fits the 20ms/50Hz budget (mean 0.26ms, max
-  0.33ms) -- unsurprising, since Level 0 (do nothing) is all it ever needs
-  there. On **Exp 5's stress case (P_A), it does not**: mean 11.9ms, p95
-  17.6ms, **max 22.3ms -- over budget**. Disabling Level 2 drops the mean to
-  0.4ms, isolating the cause: the Level-2 QP (cvxpy/OSQP, which reconstructs
-  the optimization problem from scratch every single call rather than reusing
-  a compiled/parametrized form) accounts for **~97% of the online-step cost**
+  B3's online per-cycle step easily fits the 20ms/50Hz budget (mean 0.27ms, max
+  under 0.5ms across repetitions) -- unsurprising, since Level 0 (do nothing)
+  is all it ever needs there. On **Exp 5's stress case (P_A), it does not**.
+  This finding needed a second pass to get right: a single rollout's max is
+  not trustworthy on a shared dev machine, since wall-clock latency is noisy
+  (one early run showed max=17.2ms, i.e. apparently fitting, until repeated
+  runs revealed that was the lucky outlier, not the typical case). The
+  benchmark now pools 5 independent repetitions: mean (~12ms) and p95
+  (~17.5ms) are stable and reproducible across repeats, both nominally under
+  budget on average, but **the per-repetition max is consistently over
+  budget** -- typically 40-90ms (2-4.5x budget) in 4 of 5 repeats, with an
+  occasional repeat closer to the boundary (~21-22ms) but never actually
+  under it in repeated testing. Disabling Level 2 drops the mean to ~0.4ms,
+  isolating the cause: the Level-2 QP (cvxpy/OSQP, which reconstructs the
+  optimization problem from scratch every single call rather than reusing a
+  compiled/parametrized form) accounts for **~97% of the online-step cost**
   whenever it's actually being solved every cycle. This is a genuine, reported-
   as-found limitation, not smoothed over: none of the simulated results above
   are invalidated by it (this is offline simulation -- wall-clock Python cost
