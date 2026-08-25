@@ -1,0 +1,324 @@
+# Predictive Physical Realizability: A Unified Planning–Execution Feedback Architecture for Motion Planning
+
+**Draft status:** Internal working draft, not submission-ready. Assembled from `predictive_realizability_architecture.md` and the companion research plan. Every open item flagged in those documents is preserved below as an explicit, visible flag rather than silently resolved — see the *Draft Status and Open Items* section at the end before treating any claim here as final. Per the source document's own publication-sequencing note, substantive external submission should wait until `mp_main` (ICRA 2027) and HAE (IJSS) have decisions.
+
+---
+
+## Abstract
+
+Motion planners — sampling-based, optimization-based, or fixed-structure time-domain planners — certify geometric and kinematic feasibility: that a path is collision-free and respects declared velocity/acceleration bounds. None of the widely deployed planning stacks certify *dynamic physical realizability*: whether the robot's actuators, given its current configuration, contact state, payload, and disturbance environment, can actually execute the planned motion as time progresses. Because actuator authority is state- and environment-dependent, a trajectory can be kinematically feasible and still drive one or more joints toward saturation in the near future. This paper introduces **predictive physical realizability**, a feedback signal that predicts future loss of actuator authority over a receding horizon and feeds it back into motion planning before the loss becomes an execution failure. We define a horizon-wide realizability certificate conditioned on predicted state, contact, payload, and disturbance information; a hierarchical planner response — retime, reshape, reroute, or safely brake — governed by whether local adaptation can restore feasibility along the current route; and conditions under which a route-level change is provably necessary. The architecture preserves the fixed-structure computational philosophy of the underlying local planner: state- and environment-dependent information enters through linear/vector terms rather than rebuilding the optimization structure online. We position the contribution against reference-governor theory, actuation-aware legged planning, and MoveIt 2's Hybrid Planning architecture, and propose a benchmark suite — reachable today on a fixed-base manipulator, with legged/humanoid extensions explicitly scoped as future work pending a resourcing decision — designed to isolate what predictive feedback adds over reactive saturation handling.
+
+---
+
+## I. Introduction
+
+Robot motion planning is conventionally organized as a pipeline: a global or sampling-based planner searches for a geometrically valid path, a time-parameterization stage converts that path into a timed trajectory subject to declared velocity/acceleration bounds, and an execution layer tracks the result. This separation is effective when the robot's dynamic capability is state-independent, but it is not: the torque required to realize a given acceleration depends on configuration, velocity, active contacts, payload, interaction forces, and external disturbance, through
+
+$$
+\tau = M(q)\,u + C(q,\dot q)\,\dot q + g(q) + J_c^\top F_c + \tau_{\mathrm{ext}}.
+$$
+
+A trajectory that is geometrically and kinematically valid at planning time can therefore still drive an actuator toward saturation once contact, payload, or disturbance conditions change — a fact that current pipelines discover only when it happens, not before. We write this as
+
+$$
+\text{kinematically feasible} \;\not\Rightarrow\; \text{physically realizable}.
+$$
+
+**MoveIt 2 as the concrete anchor for this gap.** We do not treat this as a hypothetical failure mode. MoveIt 2's default pipeline — OMPL for geometric search, Time-Optimal Trajectory Generation (TOTG) as the default time-parameterization stage, with optional Ruckig jerk-limited smoothing — is exactly the path-first architecture this paper is positioned against. A confirmed, independently verifiable pathology is documented in [moveit/moveit2#2600](https://github.com/moveit/moveit2/issues/2600): TOTG reconstructs an acceleration of roughly 200 rad/s² at a path inflection point against a declared limit of 0.2 rad/s². We cite this one issue because it is directly verifiable; two additional reports referenced in an earlier internal draft of this work could not be re-located on a follow-up search and are *not* cited here (see *Draft Status and Open Items*). Independently of any specific bug, MoveIt 2's own **Hybrid Planning** architecture already separates a slower global planner from a faster, recurrent local planner and explicitly supports event-driven, sensor-reactive replanning — a real, currently-unoccupied slot for exactly the kind of feedback this paper proposes, not a contrived integration target.
+
+**Positioning relative to OMPL.** OMPL answers the question *does a collision-free path from start to goal exist?* This paper asks the strictly downstream question: *does a physically realizable trajectory exist along this path, given the robot's configuration, contact state, payload, and predicted environment?* OMPL is not a competitor at any point in this paper; it is the standard upstream global planner, and the contribution sits at the local-planner slot of MoveIt's own Hybrid Planning architecture, consuming OMPL's output rather than replacing it.
+
+We do not claim that conventional planning pipelines are useless. We claim that their feasibility representation is incomplete, because actuator authority is a function of state and environment that the geometric/kinematic feasibility check does not see.
+
+**Key research question.** *Can future loss of physical realizability be predicted during execution and fed back to motion planning early enough that the robot can adapt, reroute, or safely brake before loss of control authority causes task failure, collision, or falling?*
+
+### A. Contributions
+
+1. **A problem formulation** that distinguishes geometric/kinematic feasibility from future actuator realizability, and defines the combined safe set $\mathcal{F}_{\mathrm{safe}} = \mathcal{F}_{\mathrm{kin}} \cap \mathcal{F}_{\mathrm{obs}} \cap \mathcal{F}_{\mathrm{dyn}}$ that existing pipelines do not jointly certify.
+2. **A predictive realizability certificate** $m_{\mathrm{phys}}$, conditioned on predicted state, contact, payload, and disturbance information, that bounds actuator margin over a receding horizon without requiring the local planner's optimization structure to be rebuilt online.
+3. **A hierarchical planning response** — execute, retime, reshape, reroute, or safely fall back — together with a theorem-backed condition (Theorem 3) for when route-level replanning is necessary rather than merely convenient.
+4. **A real-time architecture and benchmark design** targeting MoveIt 2's Hybrid Planning interface, with an experiment suite that isolates the contribution of prediction, adaptation, and rerouting individually via ablation.
+
+We deliberately do *not* claim to be the first work to consider actuator limits in motion planning, to have invented margin-based feedback, or to guarantee safety under arbitrary disturbance — see §X and *What This Paper Does Not Claim* below. The novelty we claim is narrower: a predictive feedback interface that converts future physical-realizability information from the execution layer into planner-level adaptation and route-level replanning, unified across geometric and physical failure modes under one hierarchical response.
+
+---
+
+## II. Related Work
+
+**A. Motion planning and time parameterization.** Sampling-based planners such as OMPL certify geometric feasibility; time-parameterization methods (TOTG, TOPP-RA, Ruckig) subsequently fit a time law respecting declared kinematic bounds. These methods do not represent configuration-, contact-, or payload-dependent actuator authority as a planning-time signal; the pathology in moveit/moveit2#2600 is a direct, currently open, symptom of that gap.
+
+**B. Reactive and hybrid motion planning.** MoveIt 2's Hybrid Planning architecture separates a slower global planner from a faster recurrent local planner and explicitly supports event-driven, sensor-reactive local adaptation, including to changing surface conditions. This paper's contribution is not the hybrid architecture itself, but a new feedback signal and local planning constraint that occupies that architecture's local-planner slot.
+
+**C. Reference governors and safety filters.** Reference Governors and Explicit Reference Governors (Garone, Di Cairano, and Kolmanovsky, *Automatica* survey, 2017; origins in Bemporad, Casavola, and Mosca, early 1990s) predict a scalar margin to constraint violation — the Dynamic Safety Margin — and modulate a reference command to keep the closed loop inside a safe invariant set before violation occurs. This is conceptually the closest prior architecture to the margin-feedback idea at the center of this paper, and we do not claim novelty for "predict a margin and feed it back before a constraint is violated" as a general principle: that principle is three decades old. What is not addressed by the reference-governor literature, to our knowledge, is a margin specifically defined over actuator/torque authority, conditioned jointly on predicted contact, payload, and terrain information, coupled to a planner response that includes route-level replanning rather than only reference modulation within a fixed route.
+
+A closely related recent architecture is the **Path Feasibility Governor** (Zhang, Liu, and Liao-McPherson, arXiv:2507.09134, 2025), which places a governor between a path planner and a nonlinear MPC controller and proves constraint satisfaction, stability, and recursive feasibility under a modular, replanning-compatible design. The high-level architecture is close to the one proposed here (§III–§V). We differ in that the present work (i) conditions the realizability certificate explicitly on predicted environment, contact, and payload information rather than the nominal path alone, (ii) defines an explicit taxonomy of geometric versus physical failure with a hierarchical, mechanism-differentiated response (§V), and (iii) targets actuator/torque realizability specifically rather than general MPC constraint satisfaction. We flag this as the piece of prior art requiring the most careful textual differentiation before any external submission (see *Draft Status and Open Items*).
+
+**D. Actuation-aware and dynamics-aware planning.** Prior work has incorporated torque limits, feasible wrench sets, and dynamic feasibility into trajectory optimization and legged locomotion planning. Retiming a nominal trajectory under predicted torque saturation is itself a mature sub-field with roots at least to disturbance-observer-based path tracking under torque saturation in the early 2000s; we treat retiming (our Level 1, §V) as an established baseline mechanism, not a contribution. For legged systems specifically, Orsolino, Focchi, and colleagues' actuation-aware extension of the support region projects joint-torque limits through terrain-dependent contact configurations into a feasible base-motion region, closely related to the environment-conditioning story in §IV for legged platforms; related work projects torque limits into task space for trajectory optimization on non-flat terrain. Acosta and Posa's perceptive mixed-integer footstep control for underactuated bipedal walking on rough terrain (*IEEE Transactions on Robotics*, 2025) is, to our knowledge, the closest legged/terrain-aware actuation work published in this paper's own target venue, and must be read and differentiated in full before any submission that touches legged or terrain scenarios (see *Draft Status and Open Items* — this has not yet been done as of this draft).
+
+**E. Position of this work.** No single piece of prior art we have located combines (i) a unified failure taxonomy spanning geometric and physical failure modes, (ii) a hierarchical adapt-then-reroute-then-fallback response with an explicit necessity condition for route-level change, (iii) a certificate jointly conditioned on predicted contact, payload, terrain, and disturbance, and (iv) demonstrated generality across a fixed-base manipulator and, pending resourcing, legged platforms. Each individual mechanism, however, is independently well established, and our contribution claims are scoped accordingly (§I-A, and see *What This Paper Does Not Claim* below).
+
+---
+
+## III. Problem Formulation
+
+Let $x_k = (q_k, \dot q_k)$ be the robot state at discrete time $k$, and let $E_{k:k+N}$ denote predicted environment information over a horizon of length $N$ — terrain height and slope, expected contact locations and timing, friction, payload, and anticipated external disturbance or interaction force. A nominal motion planner $\mathcal{P}$ produces a candidate trajectory $u^{\mathrm{nom}}_{0:N-1}$ (and the induced state sequence $x_{0:N}$) that is certified against two feasibility sets already representable by existing pipelines:
+
+$$
+\mathcal{F}_{\mathrm{kin}}(x) \quad \text{(kinematic feasibility: velocity, acceleration, joint-limit bounds)},
+$$
+$$
+\mathcal{F}_{\mathrm{obs}}(x, E) \quad \text{(collision/obstacle feasibility, given predicted environment } E\text{)}.
+$$
+
+We introduce a third set, not represented by conventional pipelines:
+
+$$
+\mathcal{F}_{\mathrm{dyn}}(x, E) = \{\, x : \text{the actuator command required to realize the requested motion at } x \text{ under } E \text{ lies within actuator limits} \,\}.
+$$
+
+The joint safe set the planner should certify is
+
+$$
+\mathcal{F}_{\mathrm{safe}} = \mathcal{F}_{\mathrm{kin}} \cap \mathcal{F}_{\mathrm{obs}} \cap \mathcal{F}_{\mathrm{dyn}}.
+$$
+
+Existing planning pipelines certify $\mathcal{F}_{\mathrm{kin}} \cap \mathcal{F}_{\mathrm{obs}}$ at planning time and discover violations of $\mathcal{F}_{\mathrm{dyn}}$ only at execution time, typically through actuator saturation, tracking-error growth, or, on a floating-base or legged platform, loss of balance. The central problem this paper addresses is: *under what conditions can $\mathcal{F}_{\mathrm{dyn}}$-membership be predicted ahead of execution, and how should the planner respond when prediction indicates future loss of membership?*
+
+We assume bounded model uncertainty (bounded error between the dynamics model used for prediction and the true plant) and bounded external/contact-force prediction error over the horizon; both assumptions are stated explicitly wherever they are used and are not claimed to hold unconditionally (see the assumption-scoped statement of Theorem 1, §VI).
+
+---
+
+## IV. Predictive Physical-Realizability Certificate
+
+For the nominal predicted trajectory $\mathbf{x}_{0:N}, \mathbf{u}_{0:N}$, define the per-joint, per-horizon-step torque margin
+
+$$
+m_{\tau,i}(k+j) = \tau_{i,\max} - |\tau_i(k+j)|,
+$$
+
+and its uncertainty-tightened form, using a predicted torque estimate $\hat\tau_i$ and an explicit uncertainty bound $\Delta\tau_i$ that accounts for model mismatch and contact/disturbance prediction error,
+
+$$
+m_{\tau,i}^{\mathrm{robust}}(k+j) = \tau_{i,\max} - |\hat\tau_i(k+j)| - \Delta\tau_i(k+j).
+$$
+
+The aggregate horizon certificate — the single scalar we carry into the theoretical results of §VI — is
+
+$$
+m_{\mathrm{phys}}(k) = \min_{j=0,\dots,N} \; \min_i \; m_{\tau,i}^{\mathrm{robust}}(k+j).
+$$
+
+Three complementary signals are reported as experimental diagnostics rather than carried into the formal results, to keep the required proof burden proportional to a 3–4-contribution paper: directional authority $\alpha_{\mathrm{dir}}(k+j)$ (remaining control/acceleration authority in the direction the current task demands, useful for distinguishing "some margin remains, but not in the direction needed" from an aggregate scalar); time-to-loss $T_{\mathrm{loss}} = \min\{\,j\Delta t : m_{\mathrm{phys}}(k+j) \le 0\,\}$; and cumulative risk $J_{\mathrm{phys}} = \sum_j \phi(m_{\mathrm{phys}}(k+j))$ for a chosen penalty function $\phi$.
+
+**Environment conditioning.** The certificate is a function of predicted environment and contact information as well as state:
+
+$$
+\big(E_{k:k+N},\, x_k,\, u^{\mathrm{nom}}_{k:k+N}\big) \;\longrightarrow\; \tau_{k:k+N} \;\longrightarrow\; m_{\mathrm{phys}}.
+$$
+
+This is the step that distinguishes the contribution from a torque-limit checker: a trajectory can be entirely collision-free and still fail $\mathcal{F}_{\mathrm{dyn}}$ because the *predicted* terrain, contact, or payload state along the route demands more torque than is available, i.e.
+
+$$
+\text{collision-free} \;\not\Rightarrow\; \text{physically realizable}.
+$$
+
+A representative (illustrative, not yet run — see *Draft Status and Open Items*) instance: on flat ground a legged platform's ankle-torque margin is $m_{\mathrm{ankle}} = 0.42$; the same nominal footstep trajectory into a predicted shallow hole yields $m_{\mathrm{ankle}} = 0.05$; continuing the unmodified nominal trajectory would drive $m_{\mathrm{ankle}} < 0$ at the moment of contact. The certificate exposes this before the step is taken, giving the planner the opportunity to adjust footstep placement, timing, or center-of-mass trajectory rather than discovering the deficit at contact.
+
+---
+
+## V. Feedback Planning Architecture
+
+### A. Failure taxonomy
+
+We retain the geometric/topological failure signal from prior work in this line ($\sigma_1 \vee \sigma_2 \vee \sigma_3$: QP infeasibility, planner stagnation, and prediction/Jacobian linearization drift, respectively) and add a physical-realizability signal:
+
+$$
+\sigma_{\mathrm{geo}} = \sigma_1 \vee \sigma_2 \vee \sigma_3, \qquad \sigma_4 = \big[\, m_{\mathrm{phys}}(k+j) < m_{\mathrm{safe}} \text{ for some } j \in [0,N] \,\big].
+$$
+
+The two signals demand structurally different responses, and $\sigma_4$ must not be collapsed into the existing geometric-escape mechanism as though it were a fourth instance of the same trigger:
+
+$$
+\sigma_{\mathrm{geo}} \Rightarrow \textbf{change WHERE}, \qquad \sigma_4 \Rightarrow \textbf{change HOW first, change WHERE only if adaptation cannot restore feasibility.}
+$$
+
+The reason this distinction matters architecturally: a geometric escape mechanism retargets the route ($h_{\mathrm{esc}}$ in the underlying QP) while leaving the kinematic feasible set unchanged. This is the correct response to a topological trap, but it does nothing for $\sigma_4$: if $m_{\mathrm{phys}}$ has collapsed because the *current* route demands more torque than is available, retargeting within the same route's local neighborhood does not necessarily restore torque margin, and only retiming, reshaping, or a genuine route-level change can.
+
+### B. Hierarchical response
+
+- **Level 0 — Normal execution.** If $m_{\mathrm{phys}}(k) \ge m_{\mathrm{safe}}$, execute the nominal trajectory unmodified.
+- **Level 1 — Retiming.** The route remains dynamically realizable, but the nominal timing over-demands the actuators: reparameterize $q(s) \to q(t_{\mathrm{new}})$ with reduced velocity/acceleration along the same geometric path. This mechanism is a mature baseline (§II-D), not a contribution of this paper.
+- **Level 2 — Trajectory reshaping.** Modify the acceleration profile, center-of-mass motion, contact timing, or local target while remaining on the same route, to restore $m_{\mathrm{phys}} > 0$ without changing the route.
+- **Level 3 — Rerouting/replanning.** If no retiming or reshaping along the current route restores realizability — formally, if $\mathcal{T}_{\mathrm{dyn}}(p) = \emptyset$ for the current route $p$ (Theorem 3, §VI) — the route itself must change: $p \to p'$.
+- **Level 4 — Safe braking/fallback.** If no feasible continuation exists within the available reaction horizon, invoke a braking or terminal-safe-set policy. This level exists so the architecture does not implicitly assume every failure is solvable by further replanning.
+
+### C. The Level 3 mechanism (open item)
+
+Level 3 requires a concrete rerouting mechanism, and simply invoking "global replanning or the existing geometric-escape mechanism" is not yet justified. The existing geometric-escape mechanism selects an escape target to restore topological/geometric clearance; it has no explicit notion of torque margin, and there is no a priori reason a geometrically-motivated escape target also satisfies lower dynamic demand. We flag this as an open design question rather than assume it away: either (a) it must be shown that geometric-escape-selected targets are more dynamically realizable than the original route under stated conditions, or (b) $\sigma_4$-triggered rerouting must use a mechanism distinct from the geometric-escape mechanism — for example, re-invoking the global planner with an added torque-cost term, or constraining the geometric-escape target search to $\mathcal{F}_{\mathrm{dyn}}$-feasible candidates. This step is currently assumed, not shown, and must be closed before Theorem 3 (§VI) can be considered a complete justification for the full Level 0–4 hierarchy rather than for the narrower "adapt-then-reroute" claim it currently supports.
+
+---
+
+## VI. Theoretical Analysis
+
+Throughout, we use $\xi_k$ generically for a tracking-error or deviation state where relevant to a specific result, and reuse the sets $\mathcal{F}_{\mathrm{kin}}$, $\mathcal{F}_{\mathrm{obs}}$, $\mathcal{F}_{\mathrm{dyn}}$, $\mathcal{F}_{\mathrm{safe}}$ from §III.
+
+**Theorem 1 (Realizability certificate).** *Under bounded model uncertainty and bounded external/contact-force prediction error over the horizon, if $m_{\mathrm{phys}}(k+j) \ge 0$ for all $j \in [0, N]$, then the predicted nominal trajectory satisfies the actuator constraints over the horizon.*
+
+*Proof strategy.* This is definitional once the assumptions are made explicit: $m_{\mathrm{phys}}(k+j) \ge 0$ means, by construction of $m_{\tau,i}^{\mathrm{robust}}$, that for every joint $i$ and every horizon step $j$, $\tau_{i,\max} - |\hat\tau_i(k+j)| - \Delta\tau_i(k+j) \ge 0$. If the true torque $\tau_i(k+j)$ satisfies $|\tau_i(k+j) - \hat\tau_i(k+j)| \le \Delta\tau_i(k+j)$ — the bounded-uncertainty assumption, restated as an explicit per-step guarantee rather than an unconditional claim — then $|\tau_i(k+j)| \le |\hat\tau_i(k+j)| + \Delta\tau_i(k+j) \le \tau_{i,\max}$ follows directly, for every joint and every horizon step, which is the statement that the actuator constraints hold over the horizon. The theorem is exactly as strong as the uncertainty bound $\Delta\tau_i$ used to construct it, and it certifies the constraint-inactive predicted trajectory *as predicted* — it does not, by itself, say anything about closed-loop behavior once feedback, replanning, or an inaccurate $\Delta\tau_i$ are in play; that is addressed separately by the assumptions attached to Theorems 2 and 3 and is not claimed here.
+
+**Theorem 2 (Realizability-preserving adaptation).** *Suppose the nominal route admits at least one trajectory with $\mathcal{F}_{\mathrm{kin}} \cap \mathcal{F}_{\mathrm{obs}} \cap \mathcal{F}_{\mathrm{dyn}} \ne \emptyset$ (an explicit precondition). If the local adaptation problem (Level 1/2, §V-B) includes the predictive dynamic-feasibility constraint and is feasible, the resulting trajectory remains geometrically feasible while restoring actuator realizability, without necessarily changing the global route.*
+
+*Proof strategy.* By the stated precondition, a nonempty target set exists within the current route's neighborhood. The Level 1/2 adaptation problem is posed as a constrained optimization over retiming/reshaping parameters subject to $\mathcal{F}_{\mathrm{kin}} \cap \mathcal{F}_{\mathrm{obs}} \cap \mathcal{F}_{\mathrm{dyn}}$ jointly, rather than $\mathcal{F}_{\mathrm{kin}} \cap \mathcal{F}_{\mathrm{obs}}$ alone as in a conventional retiming stage; if this constrained problem returns a feasible solution, that solution is a certificate of membership in the joint set by construction of the problem, and membership in $\mathcal{F}_{\mathrm{kin}} \cap \mathcal{F}_{\mathrm{obs}}$ in particular means the result is unchanged in its geometric route. The result is essentially an existence statement conditioned on solver feasibility, not a claim that the adaptation problem is always feasible when the precondition holds — the precondition guarantees *some* feasible trajectory exists along the route, not that the specific retiming/reshaping parameterization used by Level 1/2 is expressive enough to reach it. Closing that expressiveness gap for a specific parameterization is implementation-dependent and is left to §VII/§VIII rather than claimed in general here.
+
+**Theorem 3 (Rerouting necessity).** *For a route $p$, define $\mathcal{T}_{\mathrm{dyn}}(p)$ as the set of dynamically realizable trajectories along $p$. If $\mathcal{T}_{\mathrm{dyn}}(p) = \emptyset$, no retiming-only or local acceleration modification recovers physical realizability along $p$; a route-level change is necessary.*
+
+*Proof strategy.* This is immediate from the definition of $\mathcal{T}_{\mathrm{dyn}}(p)$ as the set of dynamically realizable trajectories *along $p$*: any retiming or local reshaping of the nominal trajectory that stays on $p$ produces, by definition, another element of the trajectory space associated with $p$, so if that space's dynamically-realizable subset is empty, no such modification can be dynamically realizable either. The content of the theorem is therefore not the (trivial) logical step, but the operational claim it licenses: an empty $\mathcal{T}_{\mathrm{dyn}}(p)$ is a *sufficient condition to stop attempting Level 1/2 adaptation* and invoke Level 3 rerouting — this is what makes the theorem the mathematical justification for the adapt-then-reroute transition in §V-B, rather than a restatement of the definition. In practice, $\mathcal{T}_{\mathrm{dyn}}(p) = \emptyset$ is not directly checkable in closed form for a general nonlinear plant; §VII discusses the certificate-based proxy actually used to trigger Level 3, and its false-positive/false-negative behavior relative to the idealized condition stated here is an open empirical question addressed by the ablations in §VIII rather than proved.
+
+**Theorem 4 (Recursive feasibility / safe fallback) — deferred.** A terminal safe set $\mathcal{X}_f$ such that every $x_k \in \mathcal{X}_f$ admits a bounded safe braking policy satisfying actuator and collision constraints, with the recursive-feasibility property $x_k \in \mathcal{X}_f \Rightarrow x_{k+1} \in \mathcal{X}_f$, would strengthen Level 4 (§V-B) from a heuristic fallback into a formally guaranteed one. We have not constructed such a set or proved this property for the present architecture, and we do not claim it here. Per the source planning document's own guidance, this result is attempted only if the required assumptions can be established without becoming so restrictive as to be vacuous for the platforms in §VIII; if that turns out not to be achievable, Theorem 4 should be omitted from any submission-ready version of this paper and Level 4 presented as an engineered, empirically-validated fallback rather than a formally certified one. This is stated as an open item, not resolved.
+
+**Computational structure.** A property we carry over unchanged from the underlying fixed-structure local planner: the prediction matrices and QP Hessian ($H, \Phi, \Gamma, C_{\mathrm{kin}}$) remain fixed online; state- and environment-dependent information enters only through vector terms ($h(x,E)$, $d(x,E)$, margin vectors), the same mechanism already used for obstacle rows. Adaptive numerical values are not the same as an adaptive solver structure, and preserving this distinction is what keeps the architecture real-time-capable as more predictive signals are added (§VII).
+
+---
+
+## VII. MoveIt 2 / Real-Time Implementation
+
+The proposed integration preserves MoveIt 2's global planner (OMPL) unmodified and replaces only the local-planner component of MoveIt's Hybrid Planning interface, which is explicitly designed to accept custom global/local planner plugins and event-driven planning logic:
+
+```
+MoveIt Global Planner (OMPL)
+        |
+        v
+  Global trajectory
+        |
+        v
+Predictive-Realizability-Aware Local Planner
+        |
+        +-- fixed-structure local planner (nominal trajectory)
+        +-- geometric-escape mechanism (sigma_1..sigma_3)
+        +-- predictive physical-realizability certificate (sigma_4, Sec. IV)
+        |
+        v
+   Controller --> Robot --> state/contact/force feedback
+```
+
+The local-planner slot runs the fixed-structure planner at its native rate, evaluates $m_{\mathrm{phys}}$ over the receding horizon each cycle using the current state estimate and the latest available environment/contact prediction, and triggers the Level 0–4 response of §V based on $\sigma_{\mathrm{geo}}$ and $\sigma_4$. Because the certificate and the geometric-escape mechanism both enter the underlying QP only through vector terms rather than restructuring it, the additional real-time cost of evaluating $m_{\mathrm{phys}}$ each cycle is a torque-prediction pass over the horizon (an inverse-dynamics evaluation per step) plus a margin computation, not a change in the QP's sparsity structure or size. §VIII-E reports the measured cost of this addition rather than asserting it is negligible.
+
+---
+
+## VIII. Experimental Evaluation — Proposed Benchmark Design
+
+No experiments have been run as of this draft; this section is a design specification, not a results section, and every number below is a planned parameter, not a measured outcome. All experiments in this section are scoped to what is reachable today (fixed-base manipulator, simulation with optional real-hardware validation); legged/humanoid extensions are described separately in §VIII-F and explicitly deferred pending the resourcing decision noted in *Draft Status and Open Items*.
+
+### A. Platform and baselines
+
+**Platform.** Franka FR3 (or Panda), MoveIt 2, ROS 2, MuJoCo (or Isaac Sim) as the primary simulator, with optional real-hardware validation on the FR3 if available. This platform is chosen because it has mature MoveIt integration, well-characterized per-joint torque limits, and manageable payload/interaction-force experiment design — matching Phase I of the source planning document's platform staging.
+
+**Baselines and the system under test.**
+- **B1 — MoveIt standard.** OMPL (global) $\to$ TOTG (time parameterization) $\to$ execution. No predictive feedback of any kind.
+- **B2 — MoveIt Hybrid Planning, reactive local planner.** OMPL (global) + a conventional reactive local planner that responds to *current*-state saturation (e.g., clips or re-scales the command when the current torque exceeds a limit) but does not predict.
+- **B3 — Proposed architecture.** OMPL (global) + fixed-structure local planner + geometric-escape mechanism + predictive physical-realizability certificate (this work).
+
+B2 vs. B3 is the primary, fair comparison: both share the same global planner and the same local-planner slot in MoveIt's architecture, differing only in whether the local planner is reactive or predictive. B1 is retained as the unmodified-default reference point.
+
+### B. Experiment 1 — Baseline manipulation trajectory
+
+A representative reach-and-place trajectory (pick-and-place style, no payload change, static obstacles) is executed under B1/B2/B3. Metrics: planning time, execution time, peak per-joint torque, minimum torque margin achieved during execution, count of declared-acceleration-limit violations, tracking error (RMS and peak), and minimum obstacle clearance. This experiment establishes that the proposed architecture does not regress ordinary-case performance relative to B1/B2 before any of the harder scenarios below are introduced.
+
+### C. Experiment 2 — Payload variation (authority loss without geometry change)
+
+The identical geometric trajectory from Experiment 1 is re-executed at a sequence of payload masses spanning the manipulator's rated capacity (e.g., 0%, 40%, 70%, 90%, 100%, 110% of rated payload — the 110% point deliberately probes just past the nominal rating). Because the geometric path and time law are held fixed, this experiment isolates the central claim that identical geometry does not imply identical physical feasibility. Primary metric: at which payload level does each baseline first exhibit a torque-limit violation or tracking-error growth, versus at which payload level B3's certificate first reports $m_{\mathrm{phys}} < m_{\mathrm{safe}}$ and triggers Level 1/2 adaptation — the gap between these two payload levels (if any) is the quantity of interest, not a single pass/fail outcome.
+
+### D. Experiment 3 — External interaction force (detection lead time)
+
+During execution of the Experiment 1 trajectory, an external wrench $F_{\mathrm{int}}(t)$ is applied at the end-effector or a specified link (e.g., a scripted push profile with a ramp onset, magnitude swept across a range informed by the robot's rated payload/force capacity). Compared: B1 (no handling), B2 (reactive, current-state saturation handling only), B3 (proposed). Primary metric:
+
+$$
+T_{\mathrm{warning}} = T_{\mathrm{failure}} - T_{\mathrm{detection}},
+$$
+
+the lead time between when the system first has actionable information that a failure is coming and when the failure would actually occur under an unmodified nominal trajectory. $T_{\mathrm{warning}} = 0$ or undefined for B1 by construction (no detection mechanism); the comparison of interest is B2 versus B3, since B2 detects only once torque is already at the limit while B3 predicts the crossing before it occurs.
+
+### E. Experiment 4 — Contact-stiffness/payload-step discontinuity (FR3-realizable terrain analogue)
+
+The source planning document's original terrain experiment (flat/slope/hole/step) presumes a legged or mobile platform that is not part of the reachable Phase I scope (see §VIII-F and *Draft Status and Open Items*). We substitute an FR3-realizable analogue that preserves the experiment's actual point — that a trajectory can be collision-free while the *predicted* environment along the route changes what torque is required — without requiring a terrain rig: a step change in end-effector contact stiffness or an abrupt, scripted payload change (e.g., a simulated hand-off or a contact transition from free space to a stiff surface) at a known point along an otherwise fixed geometric trajectory. The environment-prediction signal $E_{k:k+N}$ is the known upcoming contact/stiffness transition; the comparison is whether B3's certificate anticipates the transition and adapts (Level 1/2) before the transition occurs, versus B1/B2 discovering the transition's effect only once already in contact. This experiment demonstrates the environment-conditioning contribution (§IV) without deferring it entirely to Phase II.
+
+### F. Experiment 5 — Flagship: geometrically feasible, dynamically infeasible route
+
+Construct two candidate routes between the same start and goal configuration: $P_A$, shorter in path length but passing through a region of high dynamic demand (e.g., a near-singular wrist configuration under payload, where large joint velocities are required for a given end-effector speed); and $P_B$, longer but remaining in a well-conditioned region throughout, under the same payload. A conventional planner selects $P_A$ on path-length grounds alone. This experiment is FR3-realizable without any terrain rig — the "environment" here is the manipulator's own configuration-dependent conditioning under a fixed payload, which is already fully characterized by the FR3's kinematics and dynamics model. Expected comparison: B1/B2 select and attempt $P_A$, discovering the dynamic infeasibility during execution (torque saturation, tracking failure, or a stall); B3's certificate predicts $\mathcal{T}_{\mathrm{dyn}}(P_A) = \emptyset$ (or a near-empty margin) before committing to $P_A$ and triggers Level 3 rerouting to $P_B$. This is the experiment most directly validating Theorem 3, and is proposed as the paper's flagship result.
+
+### G. Experiment 6 — Adaptation-versus-rerouting continuum
+
+A single scenario family is parameterized by severity (e.g., a swept payload or interaction-force magnitude) to produce four regimes, directly validating the Level 0–4 hierarchy of §V-B rather than only its endpoints:
+- **Case A (small margin loss):** Level 1 retiming alone is sufficient to restore $m_{\mathrm{phys}} \ge m_{\mathrm{safe}}$.
+- **Case B (moderate loss):** retiming alone is insufficient; Level 2 reshaping is required and sufficient.
+- **Case C (severe loss):** no retiming or reshaping along the current route suffices; Level 3 rerouting succeeds.
+- **Case D (no safe route within the reaction horizon):** Level 4 braking/fallback is invoked.
+Metric: at each swept severity level, which hierarchy level actually resolves the scenario, compared against which level the certificate *predicts* will be sufficient — the interesting failure mode to look for is the certificate under- or over-predicting the required response level, not merely whether the scenario is eventually resolved.
+
+### H. Ablations
+
+- **A1 — No predictive feedback.** Equivalent to B1.
+- **A2 — Current-state saturation only, no prediction.** Equivalent to B2.
+- **A3 — Prediction without planner feedback.** The certificate is computed and logged but not connected to the planner response (detects, does not adapt). Isolates whether prediction alone (as a monitoring signal, e.g. for an operator alert) has value distinct from acting on it.
+- **A4 — Prediction + adaptation, no rerouting.** Levels 0–2 only; Level 3/4 disabled. Isolates the marginal value of rerouting specifically, expected to show degraded performance on Experiment 5/6-Case-C specifically.
+- **A5 — Full proposed system.** Levels 0–4 (equivalent to B3).
+
+### I. Metrics (full set)
+
+Task success rate; collision rate; minimum actuator margin achieved; count of saturation events; tracking error (RMS, peak); minimum obstacle clearance; replanning count; replanning latency; local-planner per-cycle computation time; global-planner invocation rate; and **conservatism** — the fraction of executions in which the system triggers Level 2/3/4 response despite the nominal trajectory being, in fact, realizable (a false-positive rate on $\sigma_4$). Conservatism is reported alongside every safety-improvement claim in this paper, not as a secondary metric: an overly conservative certificate can trivially eliminate every failure mode above by triggering fallback constantly, which would make every other metric look good while the system is useless for its task. Any headline claim of reduced failure rate must be reported together with the corresponding conservatism figure.
+
+### J. Real-time performance
+
+Local-planner per-cycle computation time is measured directly (not assumed) for B2 and B3 under Experiment 1's nominal trajectory and under Experiment 5's near-singular-configuration stress case, reporting mean, p95, and maximum, against the local planner's target cycle rate. Whether the added certificate evaluation fits the real-time budget at the stress case specifically — not only the nominal case — is treated as an open empirical question the experiment must answer, not a design assumption.
+
+### K. Deferred: legged/humanoid extensions (Phase II/III)
+
+Uneven-terrain, footstep-adaptation, and humanoid-balance experiments matching the original terrain scenario in the source planning document remain valuable future extensions of this benchmark suite but are explicitly **not** part of the Phase I reachable scope, pending the resourcing assessment in *Draft Status and Open Items*: no legged/humanoid simulation or hardware pipeline currently exists in this line of work, and building a floating-base, contact-scheduled dynamics model is architecturally distinct from the fixed-base manipulator work above.
+
+---
+
+## IX. Discussion
+
+**Conservatism versus responsiveness.** Every mechanism in §V trades safety margin against unnecessary intervention; §VIII-I's conservatism metric is the paper's answer to the concern that any predictive-safety architecture can trivially "solve" every failure mode by refusing to act. We do not yet have empirical conservatism figures to discuss, since no experiments have been run (§VIII).
+
+**Model and environment-prediction uncertainty.** Theorem 1's guarantee is exactly as strong as the uncertainty bound $\Delta\tau_i$ used to construct the robust margin; if the environment prediction $E_{k:k+N}$ is itself wrong (e.g., an unanticipated contact), the certificate degrades gracefully to the accuracy of that prediction rather than failing catastrophically, but this claim is not yet backed by an experiment specifically stressing environment-prediction error and should not be asserted more strongly than that.
+
+**Sensing latency and computational scaling** are acknowledged as relevant but not analyzed in this draft; both should be addressed with measured data (§VIII-J) rather than an a priori argument once experiments exist.
+
+**Relationship to learned/world-model planners.** §XI sketches a longer-term architecture in which a learned high-level planner (a world model or vision-language-action policy) determines *what* the robot should do, this architecture's local planner determines *how* it should move, and the predictive-realizability layer determines *whether* the robot can physically execute that behavior under current and predicted conditions. This is presented as a long-term direction, not a near-term deliverable of the present paper, and no learned-planner integration has been attempted.
+
+---
+
+## X. What This Paper Does Not Claim
+
+To keep the contribution claims defensible, this paper explicitly does not claim: to be the first torque-aware or actuator-aware motion planner; that MoveIt cannot handle dynamic constraints; that the proposed method guarantees safety under arbitrary disturbance; that predictive-saturation feedback guarantees a legged platform will not fall; or that no prior work has considered torque limits in planning. Reference and Explicit Reference Governors have predicted a margin and fed it back before constraint violation since the 1990s (§II-C); retiming under predicted torque saturation is an established sub-field (§II-D); and terrain/contact-conditioned actuation limits in legged planning have prior published treatment that this paper must cite and differentiate from, not merely acknowledge in passing (§II-D). The claim this paper makes is narrower: a predictive feedback interface that converts future physical-realizability information from the execution layer into motion-planning adaptation and, when necessary, route-level replanning, unified across geometric and physical failure modes under one hierarchical response — not the existence of torque limits, margins, or saturation constraints considered individually.
+
+---
+
+## XI. Long-Term Direction (not a deliverable of this paper)
+
+$$
+\text{World model / VLM} \to \text{Global motion planner} \to \text{Predictive physical realizability} \to \text{Whole-body / interaction controller} \to \text{Robot + environment},
+$$
+
+with the loop closed by re-planning on the realizability layer's own feedback. The high-level system decides *what* the robot should do; the planner decides *how* it should move; the realizability layer decides *whether* the robot can execute that behavior under current and predicted conditions. This is proposed as a long-term organizing idea for a model-based Physical AI stack, not a contribution defended by any result in this draft.
+
+---
+
+## XII. Conclusion
+
+Motion planning pipelines certify that a trajectory can be geometrically generated and kinematically executed; they do not, in general, continuously ask whether the robot will remain physically capable of realizing that trajectory as configuration, contact, payload, and disturbance evolve. This paper proposes predictive physical realizability as the missing feedback signal — a receding-horizon certificate on actuator margin, conditioned on predicted environment and contact information, coupled to a hierarchical planner response that adapts before rerouting and reroutes before falling back, with an explicit theorem-backed condition for when adaptation is provably insufficient. The architecture is designed to occupy an existing, currently-empty slot in MoveIt 2's own Hybrid Planning interface rather than propose a new integration target. What remains is empirical: whether the certificate's prediction lead time is large enough to matter in practice, and whether the conservatism cost of acting on it is small enough to be worth paying — both questions this draft's benchmark design (§VIII) is built to answer, and neither of which is yet answered by any result in this document.
+
+---
+
+## Draft Status and Open Items
+
+This section is deliberately not folded into the Discussion, so it cannot be silently dropped in a later editing pass. None of the following should be treated as resolved:
+
+1. **Unverified citations.** Only [moveit/moveit2#2600](https://github.com/moveit/moveit2/issues/2600) is cited as a confirmed pathology (§I). Two additional MoveIt 2 issues referenced in an earlier internal pass (a reported 2.75× acceleration-limit overshoot on a Panda; an acceleration-scaling-factor bug) could not be re-located on a follow-up search and are not cited anywhere in this draft. If they are to be used, each candidate issue number must be opened and read directly before citing.
+2. **The Level 3 / geometric-escape mechanism gap (§V-C) is open, not closed.** Either prove that geometric-escape-selected targets restore $\mathcal{F}_{\mathrm{dyn}}$ under stated conditions, or specify and implement a distinct $\sigma_4$-triggered rerouting mechanism. Theorem 3 currently justifies "adapt-then-reroute" as a decision rule, not the specific mechanism by which rerouting is carried out.
+3. **Theorem 4 (recursive feasibility) is explicitly deferred**, not proved, not disproved, and not attempted in this draft. A decision to attempt it, or to drop Level 4 to an empirically-validated (not formally certified) fallback, has not been made.
+4. **Prior art requiring full reading before any submission:** the Path Feasibility Governor paper (arXiv:2507.09134) has been summarized from its abstract-level description in the source planning document, not read in full; Acosta and Posa, *IEEE T-RO* 2025, has not been read at all and must be read before any submission touching legged or terrain scenarios, since it is published in this paper's own target venue.
+5. **Legged/humanoid resourcing is unresolved.** No legged/humanoid simulation or hardware pipeline exists in this line of work as of this draft. Phase II/III should not be treated as required scope for a first submission until a real build-cost estimate (plausibly 6–12 months per the source planning document, not confirmed here) has been obtained. §VIII-K reflects this by scoping all designed experiments to the fixed-base manipulator.
+6. **Publication sequencing.** Per the source planning document (§14 of `predictive_realizability_architecture.md`), this paper should not proceed to substantive external submission until `mp_main` (ICRA 2027) and HAE (IJSS) have received decisions, and the recommended next concrete step is a separate, narrower saturation-certificate paper (targeting SCL/L-CSS) that proves Theorems 1–3 above independent of this paper's broader scope. This draft exists so that structure, positioning, and benchmark design are ready when that sequencing allows work to continue — it is not itself the next thing to do.
+7. **No experiments have been run.** Every number, scenario parameter, and expected-outcome description in §VIII is a design choice, not a measured result. This draft contains zero fabricated data.

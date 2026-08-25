@@ -1,0 +1,52 @@
+<mujoco model="planar3r">
+  <!--
+  Reduced-order verification platform for the predictive-realizability paper (see
+  ../../predictive_realizability_paper_draft.md, Sec. VIII). A 3-DOF planar revolute
+  arm moving in a vertical plane, so gravity produces a nontrivial, configuration-
+  dependent torque demand -- this is the FR3-realizable analogue used throughout
+  Sec. VIII (a full 7-DOF FR3 URDF is not integrated here; this is the honestly-scoped
+  reduced-order benchmark, matching the convention used in the sibling saturation and
+  thread-insertion papers in this line of work). All dynamics (M(q), C(q,qdot)qdot,
+  g(q)) are computed by MuJoCo's own inverse/forward dynamics -- nothing here is a
+  hand-derived symbolic dynamics model.
+  -->
+  <compiler angle="radian"/>
+  <option gravity="0 0 -9.81" integrator="RK4" timestep="0.002"/>
+
+  <default>
+    <joint type="hinge" axis="0 1 0" damping="0.3" frictionloss="0.05"/>
+    <geom type="capsule" size="0.035" rgba="0.2 0.45 0.8 1" contype="0" conaffinity="0"/>
+  </default>
+
+  <worldbody>
+    <light diffuse="0.6 0.6 0.6" pos="0 0 3" dir="0 0 -1"/>
+    <geom type="plane" size="2 2 0.1" rgba="0.9 0.9 0.9 1" contype="0" conaffinity="0"/>
+
+    <body name="link1" pos="0 0 0.9">
+      <joint name="q1" pos="0 0 0"/>
+      <geom fromto="0 0 0  0.30 0 0" mass="1.5"/>
+      <body name="link2" pos="0.30 0 0">
+        <joint name="q2" pos="0 0 0"/>
+        <geom fromto="0 0 0  0.30 0 0" mass="1.2"/>
+        <body name="link3" pos="0.30 0 0">
+          <joint name="q3" pos="0 0 0"/>
+          <geom fromto="0 0 0  0.25 0 0" mass="0.8"/>
+          <site name="ee" pos="0.25 0 0" size="0.015" rgba="0.8 0.1 0.1 1"/>
+          <body name="payload" pos="0.25 0 0">
+            <!-- no joint: rigidly welded to link3. Mass is set programmatically
+                 per-experiment via model.body_mass[payload_id]. -->
+            <geom type="sphere" size="0.03" mass="1e-6" rgba="0.1 0.7 0.1 1"/>
+          </body>
+        </body>
+      </body>
+    </body>
+  </worldbody>
+
+  <actuator>
+    <!-- Franka-FR3-like per-joint torque limits (Nm), scaled down for a 3-DOF
+         reduced-order arm: proximal joints carry more load-bearing torque. -->
+    <motor name="m1" joint="q1" ctrlrange="-87 87" gear="1"/>
+    <motor name="m2" joint="q2" ctrlrange="-87 87" gear="1"/>
+    <motor name="m3" joint="q3" ctrlrange="-12 12" gear="1"/>
+  </actuator>
+</mujoco>
