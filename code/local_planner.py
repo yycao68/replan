@@ -136,6 +136,13 @@ class LocalPlanner:
         return self.cert.m_phys(Q, Qdot, Qddot, forces)
 
     def _search_retime_whole_route(self, traj: JointTrajectory, ee_force_fn):
+        """This is the m*_1(p) computation from the paper's Theorem 3 (Sufficient,
+        checkable condition for rerouting necessity): checking only lam_max relies
+        on the theorem's stated (not proven for the general nonlinear case)
+        monotonicity assumption -- lam -> m_phys(retimed(lam)) non-decreasing --
+        which holds exactly whenever the deficit is purely static/gravity-driven
+        (the case the negative-case test below exercises) and is not guaranteed
+        to hold in general (adversarial Coriolis cross-terms are not ruled out)."""
         cfg = self.cfg
         if self._whole_route_margin(traj.retimed(cfg.lam_max), ee_force_fn) < self.cert.m_safe:
             return None  # even maximal slowdown cannot fix it (e.g. a pure static/
