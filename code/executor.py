@@ -52,8 +52,12 @@ def rollout(
     qdot0: np.ndarray,
     duration: float,
     dt: float,
-    ee_force_schedule: Optional[Callable[[float], Optional[np.ndarray]]] = None,
+    ee_force_schedule: Optional[Callable[[float, np.ndarray], Optional[np.ndarray]]] = None,
 ) -> RolloutResult:
+    """ee_force_schedule(t, q) -> force or None, evaluated at the TRUE simulated
+    state each step (a force/torque sensor reading, in effect) -- both the force
+    actually applied to the plant and the force the shared low-level controller
+    compensates for are this same measured value."""
     n_steps = int(round(duration / dt))
     arm.data.qpos[:] = q0
     arm.data.qvel[:] = qdot0
@@ -75,7 +79,7 @@ def rollout(
             replans += 1
         margins.append(meta.get("m_phys"))
 
-        ee_force = ee_force_schedule(t) if ee_force_schedule else None
+        ee_force = ee_force_schedule(t, q_actual) if ee_force_schedule else None
         h = arm.required_torque(q_ref, qdot_ref, np.zeros(N_JOINTS), ee_force)
         M = arm.mass_matrix(q_ref)
         accel_correction = KP * (q_ref - q_actual) + KD * (qdot_ref - qdot_actual)

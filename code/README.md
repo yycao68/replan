@@ -12,7 +12,13 @@ Run `python3 run_all.py` from this directory.
   demand), with a programmatically-settable end-effector payload and Franka-FR3-
   like per-joint torque limits (87/87/12 Nm).
 - `dynamics.py` -- thin wrapper around MuJoCo's own forward/inverse dynamics
-  (`mj_inverse`, `mj_fullM`). No hand-derived symbolic dynamics anywhere.
+  (`mj_inverse`, `mj_fullM`). No hand-derived symbolic dynamics anywhere, except
+  the external-end-effector-force term: `mj_inverse` was found, empirically, to
+  simply not respond to `xfrc_applied` at all (verified via a linear-algebra
+  check against a ctrl=0 forward-dynamics rollout, which sidesteps actuator
+  clipping and confirms the true generalized force is `J(q)^T @ F`), so that term
+  is added by hand using the module's own (finite-difference-verified) Jacobian.
+  `tests/test_dynamics.py` has a dedicated equilibrium test for this.
 - `certificate.py` -- the m_tau / m_phys predictive realizability certificate
   (paper Sec. IV), with an explicit, fixed uncertainty margin `delta_tau`.
 - `local_planner.py` -- the Level 0-4 hierarchy (paper Sec. V-B): Level 1 (retime)
@@ -42,17 +48,22 @@ confirming that a pure static (gravity-only) torque deficit is *not* fixable by
 retiming, only by reshaping/rerouting/braking, which is what the paper's own
 Level-1 discussion implies should happen.
 
-`experiments/exp1_baseline.py`, `exp2_payload_sweep.py`,
-`exp5_flagship_reroute.py`, `exp6_severity_sweep.py` are fully implemented and
-runnable, with results below from an actual run (not fabricated -- rerun
-`run_all.py` to reproduce). **`exp3_interaction_force.py` and
-`exp4_contact_stiffness_step.py` are NOT implemented yet** -- the `xfrc_applied`
-mechanism they'd need (external end-effector force) is already wired into
-`dynamics.py` and `executor.py`'s `ee_force_schedule` argument, but neither
-experiment script has been written or run. The ablation sweep (A1-A5, Sec.
-VIII-H) is likewise just `PlannerConfig` flag combinations away but has not been
-scripted as a batch. Real-time per-cycle timing (Sec. VIII-J) has not been
-measured.
+All six of `experiments/exp1_baseline.py` through `exp6_severity_sweep.py` are
+now implemented and runnable, with results below from an actual run (not
+fabricated -- rerun `run_all.py` to reproduce). Getting Exp 3/4 correct required
+extending the force interface from a constant `(2,)` value to a callable
+`ee_force_fn(t, q) -> force`, since Exp 3 needs a purely time-based schedule
+(ramp onset) while Exp 4 needs a *position*-based one (a contact force that
+depends on where the end-effector actually is, which depends on which reference
+is currently active); `local_planner.py`'s `plan_route` vs. `online_step` split
+also governs whether B3's certificate gets to see that force schedule in full at
+planning time (`force_known_at_plan_time=True`, Exp 4: a known upcoming contact
+transition) or only within the bounded online prediction horizon as it comes
+into view (Exp 3: an unanticipated disturbance -- this is what gives "detection
+lead time" a real, horizon-bounded meaning instead of oracle knowledge). The
+ablation sweep (A1-A5, Sec. VIII-H) is still just `PlannerConfig` flag
+combinations away but has not been scripted as a batch. Real-time per-cycle
+timing (Sec. VIII-J) has not been measured.
 
 ## Real results from the current implementation
 
@@ -66,6 +77,26 @@ measured.
   win, not just a torque-margin number. Conservatism over this sweep: 0/9
   triggers were false positives (every trigger corresponded to a real violation
   of the unmodified nominal trajectory).
+- **Exp 3 (interaction force, detection lead time):** a downward push (ramp onset
+  at t=0.35s, held at -55N) is applied to a moderate-payload trajectory. Ground-
+  truth failure of the unmodified nominal trajectory occurs at t=0.90s. B2 (no
+  lookahead) first reacts at t=0.90s -- exactly at failure, T_warning=0.00s, as
+  the paper's own framing predicts. **B3 first detects at t=0.48s, T_warning=0.42s.**
+  All three still fail the task at this force magnitude (peak torque ratio 1.00
+  for all) -- an honest result: the primary claim here is the lead time itself,
+  not that early detection guarantees recovery at any severity. (A parameter
+  sweep confirms B3 *does* fully avoid failure at lower force magnitudes, e.g.
+  30N, but so do B1/B2 there -- not a differentiator -- and at intermediate
+  magnitudes, 37-40N, B3 does not reliably show fewer saturation events than
+  B1/B2 either; that non-monotonicity is not yet understood and is flagged as an
+  open item rather than smoothed over.)
+- **Exp 4 (contact-stiffness transition, known in advance):** a scripted contact
+  force turns on once the end-effector descends past a virtual plane; unlike
+  Exp 3, B3 is given this contact model at planning time. B2 (reactive) first
+  responds only once already in contact, t=0.70s; **B3 responds at t=0.42s**,
+  before the transition, and finishes with **9 saturation events vs. 27-29 for
+  B1/B2** (a ~3x reduction), though again none of the three reach full task
+  success at this contact stiffness -- the same honest caveat as Exp 3.
 - **Exp 5 (flagship):** P_A (outstretched pose under a 4.5 kg payload) saturates
   and fails under B1 and B2 (peak torque ratio 1.00, 36-37 saturation events).
   B3's certificate predicts the deficit before execution, reroutes to P_B, and

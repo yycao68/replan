@@ -77,10 +77,17 @@ class LocalPlanner:
         self,
         traj: JointTrajectory,
         alt_traj: Optional[JointTrajectory] = None,
-        ee_force: Optional[np.ndarray] = None,
+        ee_force_fn=None,
     ) -> RouteDecision:
+        """ee_force_fn(t, q) -> force or None. Passing a non-None ee_force_fn here
+        means Level 1/3 are decided WITH KNOWLEDGE of the whole predicted force/
+        contact profile over the route -- appropriate when that profile is part of
+        the 'predicted environment E' the paper's Sec. IV certificate is
+        conditioned on (Exp 4: a known upcoming contact transition), not when it
+        represents a disturbance that should only become visible within a bounded
+        online prediction horizon (Exp 3: see online_step instead)."""
         cfg = self.cfg
-        m0 = self._whole_route_margin(traj, ee_force)
+        m0 = self._whole_route_margin(traj, ee_force_fn)
 
         if not cfg.predict:
             return RouteDecision(traj, 0, np.nan, triggered=False)
@@ -90,40 +97,52 @@ class LocalPlanner:
             return RouteDecision(traj, 0, m0, triggered=True)
 
         if cfg.allow_level1:
-            lam = self._search_retime_whole_route(traj, ee_force)
+            lam = self._search_retime_whole_route(traj, ee_force_fn)
             if lam is not None:
                 retimed = traj.retimed(lam)
-                m1 = self._whole_route_margin(retimed, ee_force)
+                m1 = self._whole_route_margin(retimed, ee_force_fn)
                 return RouteDecision(retimed, 1, m1, triggered=True)
 
         if cfg.allow_level3 and alt_traj is not None:
-            mb = self._whole_route_margin(alt_traj, ee_force)
+            mb = self._whole_route_margin(alt_traj, ee_force_fn)
             if mb >= self.cert.m_safe:
                 return RouteDecision(alt_traj, 3, mb, triggered=True)
             if cfg.allow_level1:
-                lam_b = self._search_retime_whole_route(alt_traj, ee_force)
+                lam_b = self._search_retime_whole_route(alt_traj, ee_force_fn)
                 if lam_b is not None:
                     retimed_b = alt_traj.retimed(lam_b)
-                    mb1 = self._whole_route_margin(retimed_b, ee_force)
+                    mb1 = self._whole_route_margin(retimed_b, ee_force_fn)
                     return RouteDecision(retimed_b, 3, mb1, triggered=True)
 
         # Nothing at route level restores feasibility; online Level 2/4 must cope.
         return RouteDecision(traj, 0, m0, triggered=True)
 
-    def _whole_route_margin(self, traj: JointTrajectory, ee_force) -> float:
+    @staticmethod
+    def _sample_forces(ts: np.ndarray, Q: np.ndarray, ee_force_fn):
+        if ee_force_fn is None:
+            return None
+        out = []
+        for t, q in zip(ts, Q):
+            f = ee_force_fn(t, q)
+            out.append([0.0, 0.0] if f is None else f)
+        return np.array(out)
+
+    def _whole_route_margin(self, traj: JointTrajectory, ee_force_fn) -> float:
         n = int(np.ceil(traj.T / self.cfg.dt)) + 1
         Q, Qdot, Qddot = traj.sample_horizon(0.0, self.cfg.dt, n)
-        return self.cert.m_phys(Q, Qdot, Qddot, ee_force)
+        ts = self.cfg.dt * np.arange(n)
+        forces = self._sample_forces(ts, Q, ee_force_fn)
+        return self.cert.m_phys(Q, Qdot, Qddot, forces)
 
-    def _search_retime_whole_route(self, traj: JointTrajectory, ee_force):
+    def _search_retime_whole_route(self, traj: JointTrajectory, ee_force_fn):
         cfg = self.cfg
-        if self._whole_route_margin(traj.retimed(cfg.lam_max), ee_force) < self.cert.m_safe:
+        if self._whole_route_margin(traj.retimed(cfg.lam_max), ee_force_fn) < self.cert.m_safe:
             return None  # even maximal slowdown cannot fix it (e.g. a pure static/
                           # gravity torque deficit) -- Level 1 correctly fails
         lo, hi = 1.0, cfg.lam_max
         for _ in range(20):
             mid = 0.5 * (lo + hi)
-            if self._whole_route_margin(traj.retimed(mid), ee_force) >= self.cert.m_safe:
+            if self._whole_route_margin(traj.retimed(mid), ee_force_fn) >= self.cert.m_safe:
                 hi = mid
             else:
                 lo = mid
@@ -134,33 +153,41 @@ class LocalPlanner:
         self,
         traj: JointTrajectory,
         t0: float,
-        ee_force: Optional[np.ndarray] = None,
+        ee_force_fn=None,
     ) -> PlanResult:
+        """ee_force_fn(t, q) -> force or None, looked ahead only over this call's
+        bounded horizon (cfg.horizon_steps * cfg.dt) -- this is what gives Exp 3's
+        'detection lead time' a real, horizon-bounded meaning rather than oracle
+        full-schedule knowledge."""
         cfg = self.cfg
         Q, Qdot, Qddot = traj.sample_horizon(t0, cfg.dt, cfg.horizon_steps)
+        ts = t0 + cfg.dt * np.arange(cfg.horizon_steps)
+        forces = self._sample_forces(ts, Q, ee_force_fn)
 
         if not cfg.predict:
             return PlanResult(0, Q, Qdot, Qddot, np.nan, np.nan, triggered=False)
 
-        m0 = self.cert.m_phys(Q, Qdot, Qddot, ee_force)
+        m0 = self.cert.m_phys(Q, Qdot, Qddot, forces)
         if m0 >= self.cert.m_safe:
             return PlanResult(0, Q, Qdot, Qddot, m0, m0, triggered=False)
         if not cfg.act:
             return PlanResult(0, Q, Qdot, Qddot, m0, m0, triggered=True)
 
         if cfg.allow_level2:
-            Qddot2 = self._try_reshape(Q, Qdot, ee_force)
+            Qddot2 = self._try_reshape(Q, Qdot, forces)
             if Qddot2 is not None:
-                m2 = self.cert.m_phys(Q, Qdot, Qddot2, ee_force)
+                m2 = self.cert.m_phys(Q, Qdot, Qddot2, forces)
                 if m2 >= self.cert.m_safe:
                     return PlanResult(2, Q, Qdot, Qddot2, m0, m2, triggered=True)
 
         Qk, Qdotk, Qddotk = self._brake_profile(Q[0], Qdot[0])
-        mk = self.cert.m_phys(Qk, Qdotk, Qddotk, ee_force)
+        ts_k = t0 + cfg.dt * np.arange(cfg.horizon_steps)
+        forces_k = self._sample_forces(ts_k, Qk, ee_force_fn)
+        mk = self.cert.m_phys(Qk, Qdotk, Qddotk, forces_k)
         return PlanResult(4, Qk, Qdotk, Qddotk, m0, mk, triggered=True)
 
     # ------------------------------------------------------------------
-    def _try_reshape(self, Q, Qdot, ee_force):
+    def _try_reshape(self, Q, Qdot, forces):
         """Level 2: convex QP over the horizon's acceleration profile, torque
         constraints linearized (exactly, since torque is affine in qddot at fixed
         q,qdot) around the nominal q,qdot for each step."""
@@ -171,7 +198,8 @@ class LocalPlanner:
         cost = 0
         for j in range(n):
             M = self.arm.mass_matrix(Q[j])
-            h = self.arm.required_torque(Q[j], Qdot[j], np.zeros(N_JOINTS), ee_force)
+            fj = None if forces is None else forces[j]
+            h = self.arm.required_torque(Q[j], Qdot[j], np.zeros(N_JOINTS), fj)
             tau_j = M @ qddot_vars[j] + h
             constraints += [
                 tau_j <= TAU_MAX - self.cert.delta_tau,

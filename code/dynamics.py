@@ -94,15 +94,26 @@ class Arm:
     ) -> np.ndarray:
         """Inverse dynamics: the joint torque required to realize (q, qdot, qddot)
         at this instant, including gravity, Coriolis/centrifugal terms, and any
-        applied external end-effector force. This is the mj_inverse-based
-        implementation of tau in Sec. IV of the paper -- 'the actuator command
-        required to realize the requested motion at x under E'."""
+        applied external end-effector force. This is the tau in Sec. IV of the
+        paper -- 'the actuator command required to realize the requested motion
+        at x under E'.
+
+        mj_inverse computes M(q)@qddot + qfrc_bias(q,qdot) but, empirically,
+        does NOT fold xfrc_applied into that result (verified directly: a linear-
+        algebra check -- M @ qacc_measured + qfrc_bias against a ctrl=0 forward-
+        dynamics rollout with the force applied, which sidesteps actuator
+        clipping entirely -- confirms the force's true generalized-force
+        contribution is J(q)^T @ F to within ~0.1% and that mj_inverse's output
+        is completely insensitive to xfrc_applied even at absurd force
+        magnitudes). So the external-force term is added by hand via the
+        Jacobian instead of relying on mj_inverse for it."""
         self.data.qpos[:] = q
         self.data.qvel[:] = qdot
         self.data.qacc[:] = qddot
-        if ee_force_xz is not None:
-            self.apply_ee_force(ee_force_xz)
-        else:
-            self.clear_external_force()
+        self.clear_external_force()
         mujoco.mj_inverse(self.model, self.data)
-        return self.data.qfrc_inverse.copy()
+        tau = self.data.qfrc_inverse.copy()
+        if ee_force_xz is not None:
+            J = self.jacobian(q)
+            tau = tau - J.T @ np.asarray(ee_force_xz)
+        return tau

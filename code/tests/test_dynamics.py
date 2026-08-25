@@ -9,7 +9,7 @@ import numpy as np
 import sys, os
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from dynamics import Arm, N_JOINTS
+from dynamics import Arm, N_JOINTS, TAU_MAX
 
 
 def test_mass_matrix_symmetric_positive_definite():
@@ -70,6 +70,35 @@ def test_payload_increases_required_torque_monotonically():
     print("OK: joint-1 required torque grows monotonically with payload mass")
 
 
+def test_external_force_equilibrium_via_forward_dynamics():
+    """required_torque's external-force handling (tau -= J^T@F, computed by hand
+    since mj_inverse itself was found not to respond to xfrc_applied at all --
+    see dynamics.py's docstring) must produce a torque that, when applied as
+    ctrl alongside the SAME external force in a genuine forward-dynamics
+    rollout, yields exactly zero acceleration. Uses a small force so the needed
+    compensation stays within the actuators' declared ctrlrange -- otherwise
+    MuJoCo's own actuator clipping would (correctly) confound the check."""
+    import mujoco
+    arm = Arm.create()
+    arm.set_payload_mass(1.0)
+    rng = np.random.default_rng(2)
+    for _ in range(10):
+        q = rng.uniform(-1.0, 1.0, N_JOINTS)
+        F = rng.uniform(-5, 5, 2)
+        tau = arm.required_torque(q, np.zeros(N_JOINTS), np.zeros(N_JOINTS), F)
+        assert np.all(np.abs(tau) < TAU_MAX), "test force too large, exceeds ctrlrange"
+
+        d, m = arm.data, arm.model
+        d.qpos[:] = q; d.qvel[:] = 0
+        d.xfrc_applied[:, :] = 0
+        d.xfrc_applied[arm.payload_body_id, 0] = F[0]
+        d.xfrc_applied[arm.payload_body_id, 2] = F[1]
+        d.ctrl[:] = tau
+        mujoco.mj_forward(m, d)
+        assert np.allclose(d.qacc, 0, atol=1e-6), f"qacc={d.qacc}, expected ~0"
+    print("OK: external-force compensation achieves exact equilibrium over 10 random cases")
+
+
 def test_jacobian_matches_finite_difference():
     arm = Arm.create()
     rng = np.random.default_rng(1)
@@ -92,5 +121,6 @@ if __name__ == "__main__":
     test_mass_matrix_symmetric_positive_definite()
     test_static_gravity_torque_horizontal_arm()
     test_payload_increases_required_torque_monotonically()
+    test_external_force_equilibrium_via_forward_dynamics()
     test_jacobian_matches_finite_difference()
     print("\nAll dynamics sanity checks passed.")

@@ -23,15 +23,18 @@ def policy_b1(traj: JointTrajectory):
     return policy
 
 
-def policy_b2(traj: JointTrajectory, arm: Arm):
+def policy_b2(traj: JointTrajectory, arm: Arm, ee_force_schedule=None):
     """Reactive, current-state-only handling: if the feedforward torque needed for
     the CURRENT instant alone (no lookahead) exceeds the actuator limit, uniformly
     throttle this step's qddot/qdot-error demand so the requested torque is closer
     to the limit. No prediction, no route awareness -- purely local and reactive,
-    matching Sec. VIII-A's B2 definition."""
+    matching Sec. VIII-A's B2 definition. ee_force_schedule(t, q) -> force, if
+    given, is sampled only at the CURRENT actual state -- B2 reacts to a force
+    already present, never to one that hasn't started yet."""
     def policy(t, q_actual, qdot_actual):
         q, qdot, qddot = traj.sample(t)
-        tau0 = arm.required_torque(q, qdot, qddot)
+        f = ee_force_schedule(t, q_actual) if ee_force_schedule else None
+        tau0 = arm.required_torque(q, qdot, qddot, f)
         ratio = np.max(np.abs(tau0) / TAU_MAX)
         if ratio > 1.0:
             scale = 1.0 / ratio
@@ -49,6 +52,7 @@ def policy_b3(
     cfg: Optional[PlannerConfig] = None,
     alt_traj: Optional[JointTrajectory] = None,
     ee_force_schedule=None,
+    force_known_at_plan_time: bool = False,
 ):
     """Full predictive architecture (or an ablation of it, via cfg flags).
 
@@ -56,16 +60,22 @@ def policy_b3(
     candidate route(s) (see local_planner.LocalPlanner.plan_route's docstring for
     why this is a deliberate simplification rather than continuous re-retiming).
     Level 2/4 are then monitored online, every control cycle, against whichever
-    route that up-front decision selected."""
+    route that up-front decision selected.
+
+    ee_force_schedule(t, q) -> force or None. force_known_at_plan_time controls
+    whether the route-level decision (Level 1/3) gets to see this schedule in
+    full (Exp 4: a known upcoming contact transition is part of the 'predicted
+    environment') or only the bounded online horizon sees it as it comes into
+    view (Exp 3: an unanticipated disturbance, detected only within the online
+    prediction horizon -- see online_step's docstring)."""
     cfg = cfg or PlannerConfig()
     planner = LocalPlanner(arm, cert, cfg)
-    ee_force_0 = ee_force_schedule(0.0) if ee_force_schedule else None
-    route = planner.plan_route(traj, alt_traj=alt_traj, ee_force=ee_force_0)
+    route_force_fn = ee_force_schedule if force_known_at_plan_time else None
+    route = planner.plan_route(traj, alt_traj=alt_traj, ee_force_fn=route_force_fn)
     state = {"active_traj": route.traj, "route_level": route.level}
 
     def policy(t, q_actual, qdot_actual):
-        ee_force = ee_force_schedule(t) if ee_force_schedule else None
-        res = planner.online_step(state["active_traj"], t, ee_force=ee_force)
+        res = planner.online_step(state["active_traj"], t, ee_force_fn=ee_force_schedule)
         level = res.level if res.level != 0 else state["route_level"]
         replanned = res.level != 0 or state["route_level"] != 0
         meta = {
