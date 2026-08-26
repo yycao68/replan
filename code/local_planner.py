@@ -16,6 +16,16 @@ exactly that mistake, silently reference-tracking a "slowed" qdot/qddot against 
 q_ref that kept marching forward at the original pace. Reshape and brake do not
 have this problem (they don't change the time law), so they run online per-cycle.
 
+What Level 3 does and does not do (also flagged in the paper's own Draft
+Status, §V-C "open item"): `plan_route` SELECTS between `traj` and an
+already-supplied `alt_traj` by their certificates; it does not search for or
+generate candidate routes. There is no route generator anywhere in this
+codebase. Every caller is responsible for constructing whatever candidates
+it wants evaluated (e.g. `trajectory.ViaPointTrajectory` for two routes that
+share a start and goal). Read "Level 3 rerouting" in code comments/output as
+"certificate-guided selection among caller-supplied candidates," not as a
+general replanner.
+
 The Level 2 QP is solved with cvxpy/OSQP over a linear-in-qddot torque model
 (tau = M(q) qddot + h(q,qdot), both M and h evaluated at the nominal q,qdot for
 the horizon -- the 'fixed structure, state-dependent vector terms' design
@@ -216,15 +226,16 @@ class LocalPlanner:
 
         best_effort = None
         if cfg.allow_level2:
-            Qddot2 = self._try_reshape(Q, Qdot, forces)
-            if Qddot2 is not None:
-                m2 = self.cert.m_phys(Q, Qdot, Qddot2, forces)
+            reshaped = self._try_reshape(Q, Qdot, forces)
+            if reshaped is not None:
+                Qn, Qdotn, Qddot2 = reshaped
+                m2 = self.cert.m_phys(Qn, Qdotn, Qddot2, forces)
                 if m2 >= self.cert.m_safe:
-                    return PlanResult(2, Q, Qdot, Qddot2, m0, m2, triggered=True)
-                best_effort = (Qddot2, m2)  # didn't fully restore margin, but is
-                                            # still the least-bad qddot profile
-                                            # found -- used only if Level 4 is
-                                            # also disabled (ablation A4), below.
+                    return PlanResult(2, Qn, Qdotn, Qddot2, m0, m2, triggered=True)
+                best_effort = (Qn, Qdotn, Qddot2, m2)  # didn't fully restore margin,
+                                            # but is still the least-bad profile found
+                                            # -- used only if Level 4 is also disabled
+                                            # (ablation A4), below.
 
         if not cfg.allow_level4:
             # A4 (Sec. VIII-H): prediction + adaptation, no rerouting AND no
@@ -233,8 +244,8 @@ class LocalPlanner:
             # reference and accept whatever happens -- the point of this
             # ablation is to show that failing without a safety net.
             if best_effort is not None:
-                Qddot2, m2 = best_effort
-                return PlanResult(2, Q, Qdot, Qddot2, m0, m2, triggered=True)
+                Qn, Qdotn, Qddot2, m2 = best_effort
+                return PlanResult(2, Qn, Qdotn, Qddot2, m0, m2, triggered=True)
             return PlanResult(0, Q, Qdot, Qddot, m0, m0, triggered=True)
 
         brake_q0 = q_actual if q_actual is not None else Q[0]
@@ -247,13 +258,39 @@ class LocalPlanner:
 
     # ------------------------------------------------------------------
     def _try_reshape(self, Q, Qdot, forces):
-        """Level 2: convex QP over the horizon's acceleration profile, torque
-        constraints linearized (exactly, since torque is affine in qddot at fixed
-        q,qdot) around the nominal q,qdot for each step."""
+        """Level 2: convex QP over the horizon's acceleration profile.
+
+        Q_new/Qdot_new are explicit double-integrator STATE variables,
+        anchored at the true current state (Q[0]/Qdot[0]) and propagated
+        forward by discrete integration of the optimized qddot, so the
+        returned (Q_new, Qdot_new, Qddot) triple is a trajectory that
+        recursively applying Qddot from Q[0]/Qdot[0] actually produces --
+        not the nominal trajectory's own Q/Qdot paired with a DIFFERENT
+        acceleration profile (an inconsistent pairing that does not
+        correspond to any trajectory the system would actually follow,
+        found during a code-vs-paper review: the certificate evaluated over
+        that pairing did not certify what recursively applying the new
+        accelerations would actually realize).
+
+        Torque is still linearized (M, h) around the NOMINAL Q/Qdot at each
+        step, not Q_new/Qdot_new -- keeping M(q) fixed per step is what
+        keeps this a QP rather than a nonconvex joint dynamics+torque
+        optimization (the 'fixed structure, state-dependent vector terms'
+        design principle, paper Sec. VI). This is re-solved fresh every
+        control cycle like any receding-horizon controller, and Q_new stays
+        close to the nominal Q over one short horizon window, so evaluating
+        M/h at the nominal point is a reasonable first-order approximation,
+        not an exact one -- the same approximation the unmodified code
+        already made, just no longer paired with a state trajectory that
+        can't actually result from the returned accelerations.
+        """
         cfg = self.cfg
         n = Q.shape[0]
+        dt = cfg.dt
         qddot_vars = [cp.Variable(N_JOINTS) for _ in range(n)]
-        constraints = []
+        q_vars = [cp.Variable(N_JOINTS) for _ in range(n)]
+        qdot_vars = [cp.Variable(N_JOINTS) for _ in range(n)]
+        constraints = [q_vars[0] == Q[0], qdot_vars[0] == Qdot[0]]
         cost = 0
         for j in range(n):
             M = self.arm.mass_matrix(Q[j])
@@ -265,6 +302,12 @@ class LocalPlanner:
                 tau_j >= TAU_MIN + self.cert.delta_tau,
                 cp.abs(qddot_vars[j]) <= cfg.qddot_box,
             ]
+            if j + 1 < n:
+                constraints += [
+                    q_vars[j + 1] == q_vars[j] + dt * qdot_vars[j]
+                                     + 0.5 * dt**2 * qddot_vars[j],
+                    qdot_vars[j + 1] == qdot_vars[j] + dt * qddot_vars[j],
+                ]
             cost += cp.sum_squares(qddot_vars[j])
         prob = cp.Problem(cp.Minimize(cost), constraints)
         try:
@@ -273,7 +316,10 @@ class LocalPlanner:
             return None
         if prob.status not in ("optimal", "optimal_inaccurate"):
             return None
-        return np.array([v.value for v in qddot_vars])
+        Q_new = np.array([v.value for v in q_vars])
+        Qdot_new = np.array([v.value for v in qdot_vars])
+        Qddot_new = np.array([v.value for v in qddot_vars])
+        return Q_new, Qdot_new, Qddot_new
 
     # ------------------------------------------------------------------
     def _brake_profile(self, q0, qdot0):

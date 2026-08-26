@@ -7,9 +7,10 @@ from __future__ import annotations
 
 from typing import Optional
 
+import cvxpy as cp
 import numpy as np
 
-from dynamics import Arm, TAU_MAX
+from dynamics import Arm, TAU_MAX, TAU_MIN, N_JOINTS
 from certificate import Certificate
 from trajectory import JointTrajectory
 from local_planner import LocalPlanner, PlannerConfig
@@ -23,24 +24,65 @@ def policy_b1(traj: JointTrajectory):
     return policy
 
 
+def _torque_feasible_qddot(arm: Arm, q, qdot, qddot_nominal, f):
+    """One-step QP: the closest (in acceleration L2 norm) qddot to the nominal
+    request that keeps tau = M(q) qddot + h(q,qdot,F) within the actuator
+    envelope, at the FIXED (q, qdot, F) this is called with -- i.e. an exact
+    torque-feasible projection at that point, not an approximation. tau is
+    affine in qddot at fixed q/qdot, so this is a genuine convex QP, unlike
+    naively scaling qddot (and qdot) by 1/ratio: h(q,qdot,F) (gravity/
+    Coriolis/external-force terms) does not scale proportionally with
+    qddot, so a scaled command's ACTUAL torque is not guaranteed to respect
+    the limit the scale factor was computed from. Returns None if the QP is
+    infeasible or fails to solve (e.g. h(q,qdot,F) alone already exceeds the
+    envelope -- no qddot can fix a deficit qddot doesn't control)."""
+    M = arm.mass_matrix(q)
+    h = arm.required_torque(q, qdot, np.zeros(N_JOINTS), f)
+    qddot_var = cp.Variable(N_JOINTS)
+    tau = M @ qddot_var + h
+    constraints = [tau <= TAU_MAX, tau >= TAU_MIN]
+    cost = cp.sum_squares(qddot_var - qddot_nominal)
+    prob = cp.Problem(cp.Minimize(cost), constraints)
+    try:
+        prob.solve(solver=cp.OSQP, verbose=False)
+    except cp.error.SolverError:
+        return None
+    if prob.status not in ("optimal", "optimal_inaccurate"):
+        return None
+    return qddot_var.value
+
+
 def policy_b2(traj: JointTrajectory, arm: Arm, ee_force_schedule=None):
-    """Reactive, current-state-only handling: if the feedforward torque needed for
-    the CURRENT instant alone (no lookahead) exceeds the actuator limit, uniformly
-    throttle this step's qddot/qdot-error demand so the requested torque is closer
-    to the limit. No prediction, no route awareness -- purely local and reactive,
-    matching Sec. VIII-A's B2 definition. ee_force_schedule(t, q) -> force, if
-    given, is sampled only at the CURRENT actual state -- B2 reacts to a force
-    already present, never to one that hasn't started yet."""
+    """Reactive, current-state-only handling: if the feedforward torque needed
+    for the CURRENT instant alone (no lookahead) exceeds the actuator limit,
+    project this step's qddot onto the torque-feasible set at the nominal
+    (q, qdot) via a one-step QP (see _torque_feasible_qddot) -- the closest
+    admissible acceleration, not a heuristic uniform throttle. No prediction,
+    no route awareness -- purely local and reactive, matching Sec. VIII-A's
+    B2 definition. ee_force_schedule(t, q) -> force, if given, is sampled
+    only at the CURRENT actual state -- B2 reacts to a force already
+    present, never to one that hasn't started yet.
+
+    (An earlier version of this policy scaled qddot AND qdot by a single
+    ratio = tau_max / tau0 factor. That is not a valid projection: torque is
+    tau = M(q) qddot + h(q,qdot,F), and h -- gravity, Coriolis, external
+    force -- does not scale with qddot, so the scaled command's actual
+    torque was not guaranteed to respect the limit the scale was computed
+    from. Found during a code-vs-paper review.)"""
     def policy(t, q_actual, qdot_actual):
         q, qdot, qddot = traj.sample(t)
         f = ee_force_schedule(t, q_actual) if ee_force_schedule else None
         tau0 = arm.required_torque(q, qdot, qddot, f)
         ratio = np.max(np.abs(tau0) / TAU_MAX)
         if ratio > 1.0:
-            scale = 1.0 / ratio
-            qddot = qddot * scale
-            qdot = qdot_actual + (qdot - qdot_actual) * scale
-            return q, qdot, qddot, {"level": "reactive-throttle", "m_phys": None}
+            projected = _torque_feasible_qddot(arm, q, qdot, qddot, f)
+            if projected is not None:
+                return q, qdot, projected, {"level": "reactive-throttle", "m_phys": None}
+            # No qddot can restore feasibility here (e.g. gravity/force alone
+            # already saturates the envelope at this q,qdot) -- fall through
+            # to the nominal reference; tau_applied's hardware clip in
+            # executor.rollout is still the final, unconditional safety net.
+            return q, qdot, qddot, {"level": "reactive-throttle-infeasible", "m_phys": None}
         return q, qdot, qddot, {"level": 0, "m_phys": None}
     return policy
 

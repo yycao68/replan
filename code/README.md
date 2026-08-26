@@ -157,10 +157,13 @@ since only the latter is actually subject to the 20ms (50 Hz) real-time budget.
   responds only once already in contact, t=0.70s; **B3 responds at t=0.42s**,
   before the transition, and -- after the Level-4 fix -- finishes with **zero
   saturation events** (previously reported as 9, before Level 4 was fixed to
-  actually hold rather than crawl) **vs. 27-29 for B1/B2**. None of the three
-  reach full task success at this contact stiffness (B3 again holds
-  permanently once braked), but B3's own outcome is now unambiguously clean:
-  it detects early, stops, and never saturates again.
+  actually hold rather than crawl) **vs. 27 for B1 and 8 for B2**. B2's number
+  dropped from a previously-reported 29 once its one-step throttle became a
+  genuine torque-feasible QP projection instead of a heuristic uniform scale
+  (see "What this is" above) -- a real, more capable B2, and still clearly
+  worse than B3's 0. None of the three reach full task success at this contact
+  stiffness (B3 again holds permanently once braked), but B3's own outcome is
+  now unambiguously clean: it detects early, stops, and never saturates again.
 - **Exp 5 (flagship):** P_A and P_B are two ROUTES between the SAME start and
   SAME goal (via `trajectory.ViaPointTrajectory`'s q0 -> via -> qf), not two
   different final configurations. (An earlier version of this experiment had
@@ -172,7 +175,11 @@ since only the latter is actually subject to the 20ms (50 Hz) real-time budget.
   `trajectory.ViaPointTrajectory`.) P_A passes through a near-singular,
   outstretched via-point under a 4.5 kg payload; B1 and B2 attempt it and
   never reach the shared goal (peak torque ratio 1.00, final position error
-  0.94 m and 0.10 m respectively, 45/54 saturation events). B3's certificate
+  0.94 m and 0.82 m respectively, 45/54 saturation events -- B2's error grew
+  from a previously-reported 0.10 m once its throttle became a genuine
+  torque-feasible QP projection instead of a heuristic scale that, on this
+  scenario, happened to permit more motion than it actually certified as
+  safe; see "What this is" above). B3's certificate
   predicts the deficit before execution (persists even at 8x retiming --
   Theorem 3's `T_dyn(p) = empty` case), reroutes to P_B, and reaches the
   IDENTICAL goal with **0.001 m final error and zero saturation events**,
@@ -243,6 +250,20 @@ since only the latter is actually subject to the 20ms (50 Hz) real-time budget.
   either a parametrized/warm-started QP formulation (cvxpy supports this via
   `Parameter`, not yet used here) or accepting that cycle as a bounded,
   planned-for overrun.
+
+  A further, real cost increase came from the Level-2 dynamics-consistency fix
+  (below): `_try_reshape`'s QP grew from optimizing only the acceleration
+  profile (`N_JOINTS` variables/step) to jointly optimizing acceleration
+  *and* the double-integrator state trajectory it implies (`3*N_JOINTS`
+  variables/step, plus `2*(horizon_steps-1)` integration-equality
+  constraints) -- a materially larger problem for OSQP to solve from scratch
+  each call. Measured directly on this same stress scenario: the one-shot
+  solve's cost roughly doubled, mean ~4.3ms, p95 ~27ms, **max ~54ms** (was
+  ~18-20ms before the fix). This is the honest price of the QP now
+  certifying a trajectory it can actually produce instead of a cheaper one
+  that mixed the nominal route's positions with different accelerations (see
+  `_try_reshape`'s docstring) -- a correctness fix, not a performance one,
+  and it makes the pre-existing over-budget finding above worse, not better.
 
 ## Known simplifications (stated once, applies throughout)
 
