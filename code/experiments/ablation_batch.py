@@ -29,8 +29,8 @@ import numpy as np
 
 from dynamics import Arm
 from certificate import Certificate
-from trajectory import JointTrajectory
-from local_planner import PlannerConfig
+from trajectory import JointTrajectory, ViaPointTrajectory
+from local_planner import LocalPlanner, PlannerConfig
 from baselines import policy_b1, policy_b2, policy_b3
 from executor import rollout
 import metrics as M
@@ -81,39 +81,53 @@ def scenario_retime_suffices():
 
 
 def scenario_reroute_required():
-    """Exp5's flagship: P_A (outstretched, heavy payload) is only rescuable by
-    rerouting to P_B. A4 (no reroute) should fail here even though A5 succeeds."""
+    """Exp5's flagship: P_A (via an outstretched via-point, heavy payload) is
+    only rescuable by rerouting to P_B -- SAME start, SAME goal, different
+    via-point (see exp5_flagship_reroute's docstring for why this must be a
+    same-goal route change, not two different final configurations, and
+    trajectory.ViaPointTrajectory for the representation that makes that
+    possible). A4 (no reroute) should fail here even though A5 succeeds."""
     Q0 = np.array([0.2, -1.0, -0.6])
-    QF_A = np.array([1.1, -0.15, 0.1])
-    QF_B = np.array([0.75, -1.15, -0.55])
-    T_A, T_B, PAYLOAD = 0.7, 0.9, 4.5
+    QG = np.array([0.75, -1.15, -0.55])         # shared goal for every ablation
+    VIA_A = np.array([1.1, -0.15, 0.1])         # P_A's via-point: outstretched, risky
+    VIA_B = 0.5 * (Q0 + QG)                     # P_B's via-point: safe midpoint
+    T1_A, T2_A = 0.5, 0.4
+    T1_B, T2_B = 0.7, 0.6
+    PAYLOAD = 4.5
     print(f"\n--- Scenario: reroute-required (flagship P_A/P_B, payload={PAYLOAD} kg) ---")
     for name in ABLATION_CFGS:
         arm = Arm.create(); arm.set_payload_mass(PAYLOAD)
         cert = Certificate(arm=arm, m_safe=2.0)
-        traj_A = JointTrajectory(Q0, QF_A, T=T_A)
-        traj_B = JointTrajectory(Q0, QF_B, T=T_B)
+        traj_A = ViaPointTrajectory(Q0, VIA_A, QG, T1=T1_A, T2=T2_A)
+        traj_B = ViaPointTrajectory(Q0, VIA_B, QG, T1=T1_B, T2=T2_B)
+        assert np.allclose(traj_A.qf, traj_B.qf), "P_A and P_B must share the same goal"
         alt = traj_B if name in ("A4", "A5") else None  # A1/A2/A3 have no route
                                                           # switching in their
                                                           # own definitions
-        goal_A = arm.ee_position(QF_A)
-        goal_B = arm.ee_position(QF_B)
-        m_probe_duration = max(T_A, T_B) + 0.3
+        goal_pos = arm.ee_position(QG)
 
         if name == "A1":
             pol = policy_b1(traj_A)
+            duration = traj_A.T + 0.3
         elif name == "A2":
             pol = policy_b2(traj_A, arm)
+            duration = traj_A.T + 0.3
         else:
             pol = policy_b3(traj_A, arm, cert, ABLATION_CFGS[name], alt_traj=alt)
-        rr = rollout(arm, pol, Q0, np.zeros(3), duration=m_probe_duration, dt=0.02)
-        err_A = np.linalg.norm(rr.ee_positions[-1] - goal_A)
-        err_B = np.linalg.norm(rr.ee_positions[-1] - goal_B)
-        m = M.compute(rr, goal_A if err_A < err_B else goal_B)
+            # Size duration to what plan_route ACTUALLY selects (peeked at
+            # directly) rather than a flat worst-case retiming budget -- see
+            # exp5_flagship_reroute's comment at the same call for why a flat
+            # cfg.lam_max budget is wrong (it surfaces an unrelated long-
+            # duration tracking instability on routes that were never retimed).
+            route = LocalPlanner(arm, cert, ABLATION_CFGS[name]).plan_route(
+                traj_A, alt_traj=alt)
+            duration = route.traj.T + 0.3
+        rr = rollout(arm, pol, Q0, np.zeros(3), duration=duration, dt=0.02)
+        m = M.compute(rr, goal_pos)
         levels = sorted(set(str(l) for l in rr.levels))
-        reached = "A" if err_A < err_B else "B"
-        print(f"{name}: success={m.task_success} (reached {reached}), levels={levels}, "
-              f"sat_events={m.saturation_events}, peak_tau_ratio={m.peak_torque_ratio:.2f}")
+        print(f"{name}: success={m.task_success} (final_pos_error={m.final_pos_error_m:.3f} m), "
+              f"levels={levels}, sat_events={m.saturation_events}, "
+              f"peak_tau_ratio={m.peak_torque_ratio:.2f}")
 
 
 def run():

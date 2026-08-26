@@ -161,22 +161,38 @@ since only the latter is actually subject to the 20ms (50 Hz) real-time budget.
   reach full task success at this contact stiffness (B3 again holds
   permanently once braked), but B3's own outcome is now unambiguously clean:
   it detects early, stops, and never saturates again.
-- **Exp 5 (flagship):** P_A (outstretched pose under a 4.5 kg payload) saturates
-  and fails under B1 and B2 (peak torque ratio 1.00, 36-37 saturation events).
-  B3's certificate predicts the deficit before execution, reroutes to P_B, and
-  completes with **zero saturation events**. This is the paper's central claim
-  (Theorem 3) exercised end to end.
-- **Exp 6 (severity sweep):** with payload as the severity knob, the hierarchy
-  visibly moves through Level 0 -> 1 -> 3 -> 4 as severity increases, with task
-  success finally failing at the most extreme severities even with Level 3/4
-  engaged (an honest negative case -- adaptation is not unconditional). One
-  finding worth flagging: **Level 2 (reshape) was only ever selected when Level 1
-  was ablated** -- in the un-ablated hierarchy, Level 1 is checked first and
-  handles every deficit in the tested range that Level 2 could also have fixed,
-  so Level 2's marginal contribution over Level 1 is not yet demonstrated by
-  these experiments. That would need a scenario engineered so retiming is
-  provably insufficient but a *non-uniform* acceleration change is not -- not yet
-  constructed here.
+- **Exp 5 (flagship):** P_A and P_B are two ROUTES between the SAME start and
+  SAME goal (via `trajectory.ViaPointTrajectory`'s q0 -> via -> qf), not two
+  different final configurations. (An earlier version of this experiment had
+  P_A and P_B end at two different goals, with the success metric scored
+  against "whichever goal was actually reached" -- that let B3 pass by simply
+  abandoning the task for an easier target, which is not the paper's claim,
+  and inflated `replans` to roughly one per control cycle instead of counting
+  actual replanning events. Both are fixed now; see `baselines.policy_b3` and
+  `trajectory.ViaPointTrajectory`.) P_A passes through a near-singular,
+  outstretched via-point under a 4.5 kg payload; B1 and B2 attempt it and
+  never reach the shared goal (peak torque ratio 1.00, final position error
+  0.94 m and 0.10 m respectively, 45/54 saturation events). B3's certificate
+  predicts the deficit before execution (persists even at 8x retiming --
+  Theorem 3's `T_dyn(p) = empty` case), reroutes to P_B, and reaches the
+  IDENTICAL goal with **0.001 m final error and zero saturation events**,
+  `replans=1`. This is the paper's central claim (Theorem 3) exercised end to
+  end, on a genuine same-goal route comparison.
+- **Exp 6 (severity sweep):** reuses Exp 5's exact same-goal P_A/P_B geometry
+  (same fix as above), swept by payload. The hierarchy visibly moves through
+  Level 0 -> 1 -> 1 -> 3 -> 3 -> 4 as severity increases (payloads
+  0/1.5/2.5/3.5/5.0/8.0 kg), succeeding at every level up to and including
+  Level 3, with task success finally failing only at the most extreme severity
+  (8.0 kg) even with Level 4 engaged (an honest negative case -- adaptation is
+  not unconditional). `replans` is 0 at Level 0 and 1 at every other severity,
+  correctly counting the single route-level (or brake-engagement) event, not
+  control cycles. One finding worth flagging: **Level 2 (reshape) was never
+  selected in the un-ablated hierarchy at any tested severity** -- Level 1 is
+  checked first and handles every deficit in the tested range that Level 2
+  could also have fixed, or Level 3 is needed outright, so Level 2's marginal
+  contribution over Level 1 is not yet demonstrated by these experiments. That
+  would need a scenario engineered so retiming is provably insufficient but a
+  *non-uniform* acceleration change is not -- not yet constructed here.
 - **Ablation batch A1-A5:** run on two scenarios chosen because they're known to
   need different levels of the hierarchy. On Exp 2's 2.4 kg crossover
   ("retime-suffices"): **A3 (predict, don't act) is bit-for-bit identical to A1
@@ -185,13 +201,15 @@ since only the latter is actually subject to the 20ms (50 Hz) real-time budget.
   unless something acts on it. A2 and A4/A5 all succeed here (consistent with
   Exp 2's finding above that this scenario doesn't separate reactive from
   predictive handling). On Exp 5's flagship P_A/P_B scenario
-  ("reroute-required"): **A4 (predict + retime/reshape, no reroute or brake)
-  fails** -- it does trigger Level 2 reshaping (`levels=['0','2']`) but ends up
-  *worse* than doing nothing (41 saturation events vs. A1's 36) -- while **A5
-  (the full architecture) succeeds cleanly via Level 3, zero saturation
-  events**. This is exactly the isolation the paper's own Sec. VIII-H text asks
-  for: rerouting's marginal contribution, shown on the one scenario nothing
-  short of it can fix.
+  ("reroute-required", same same-goal fix as Exp 5/6 above): **A4 (predict +
+  retime/reshape, no reroute or brake) fails** -- it does trigger Level 2
+  reshaping (`levels=['0','2']`) but ends up with a final position error of
+  0.98 m, effectively no better than A1's 0.94 m (47 vs. 45 saturation
+  events) -- while **A5 (the full architecture) succeeds cleanly via Level 3**,
+  reaching the identical goal with 0.001 m error and zero saturation events.
+  This is exactly the isolation the paper's own Sec. VIII-H text asks for:
+  rerouting's marginal contribution, shown on the one scenario nothing short
+  of it can fix.
 - **Real-time timing benchmark (Sec. VIII-J):** on Exp 1's nominal trajectory,
   B3's online per-cycle step easily fits the 20ms/50Hz budget (mean 0.27ms, max
   under 0.5ms across repetitions) -- unsurprising, since Level 0 (do nothing)

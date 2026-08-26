@@ -88,23 +88,44 @@ def policy_b3(
     planner = LocalPlanner(arm, cert, cfg)
     route_force_fn = ee_force_schedule if force_known_at_plan_time else None
     route = planner.plan_route(traj, alt_traj=alt_traj, ee_force_fn=route_force_fn)
-    state = {"active_traj": route.traj, "route_level": route.level, "braked": False}
+    state = {
+        "active_traj": route.traj, "route_level": route.level, "braked": False,
+        # replanned must count EVENTS, not cycles: route_level is decided once
+        # at plan time and never changes again, so testing it every cycle (the
+        # old code) would count ~one "replan" per control tick for the entire
+        # remainder of the rollout whenever Level 1/3 ever fired. Report it
+        # exactly once, on the first policy() call.
+        "route_event_reported": False,
+        "prev_online_level": 0,   # for Level 2's rising-edge event detection below
+    }
 
     def policy(t, q_actual, qdot_actual):
         if state["braked"]:
             zeros = np.zeros_like(q_actual)
-            meta = {"level": 4, "m_phys": None, "m_phys_after": None, "replanned": True}
+            # Braking is a continuing STATE once engaged, not a new event each
+            # cycle -- its one event was already reported on the engagement
+            # cycle below.
+            meta = {"level": 4, "m_phys": None, "m_phys_after": None, "replanned": False}
             return q_actual, zeros, zeros, meta
 
         res = planner.online_step(state["active_traj"], t, ee_force_fn=ee_force_schedule,
                                    q_actual=q_actual, qdot_actual=qdot_actual)
+
+        replanned_now = False
+        if not state["route_event_reported"] and state["route_level"] != 0:
+            replanned_now = True
+            state["route_event_reported"] = True
         if res.level == 4:
             state["braked"] = True
+            replanned_now = True          # the brake ENGAGEMENT is the single event
+        elif res.level == 2 and state["prev_online_level"] != 2:
+            replanned_now = True          # rising edge: reshape correction just (re)started
+        state["prev_online_level"] = res.level
+
         level = res.level if res.level != 0 else state["route_level"]
-        replanned = res.level != 0 or state["route_level"] != 0
         meta = {
             "level": level, "m_phys": res.m_phys_before,
-            "m_phys_after": res.m_phys_after, "replanned": replanned,
+            "m_phys_after": res.m_phys_after, "replanned": replanned_now,
         }
         return res.Q[0], res.Qdot[0], res.Qddot[0], meta
 
