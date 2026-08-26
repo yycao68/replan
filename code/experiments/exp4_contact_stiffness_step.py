@@ -79,7 +79,7 @@ def run():
         pre_planned = name == "B3"  # B3's route-level decision, if any, happens at t=0
 
         print(f"{name}: success={m.task_success}, first_online_trigger={first_online_trigger}, "
-              f"sat_events={m.saturation_events}, peak_tau_ratio={m.peak_torque_ratio:.2f}, "
+              f"sat_samples={m.saturation_samples}, peak_tau_ratio={m.peak_torque_ratio:.2f}, "
               f"replans={m.replans}")
 
     return results

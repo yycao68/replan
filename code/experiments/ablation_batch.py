@@ -77,7 +77,7 @@ def scenario_retime_suffices():
         goal = arm.ee_position(QF)
         m, levels = run_one(name, arm, traj, cert, goal, duration=T + 0.3)
         print(f"{name}: success={m.task_success}, levels={levels}, "
-              f"sat_events={m.saturation_events}, peak_tau_ratio={m.peak_torque_ratio:.2f}")
+              f"sat_samples={m.saturation_samples}, peak_tau_ratio={m.peak_torque_ratio:.2f}")
 
 
 def scenario_reroute_required():
@@ -126,7 +126,7 @@ def scenario_reroute_required():
         m = M.compute(rr, goal_pos)
         levels = sorted(set(str(l) for l in rr.levels))
         print(f"{name}: success={m.task_success} (final_pos_error={m.final_pos_error_m:.3f} m), "
-              f"levels={levels}, sat_events={m.saturation_events}, "
+              f"levels={levels}, sat_samples={m.saturation_samples}, "
               f"peak_tau_ratio={m.peak_torque_ratio:.2f}")
 
 

@@ -95,7 +95,7 @@ def run():
         detection_times[name] = t_detect
 
         print(f"{name}: success={m.task_success}, t_detect={t_detect}, "
-              f"sat_events={m.saturation_events}, peak_tau_ratio={m.peak_torque_ratio:.2f}, "
+              f"sat_samples={m.saturation_samples}, peak_tau_ratio={m.peak_torque_ratio:.2f}, "
               f"track_rms={m.tracking_error_rms_rad*1000:.2f}mrad, replans={m.replans}")
 
     if t_failure is not None:

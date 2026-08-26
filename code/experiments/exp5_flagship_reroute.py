@@ -7,7 +7,11 @@ reaches the identical goal via a tucked-elbow via-point that keeps the static
 torque demand low. A conventional planner (B1/B2) would attempt P_A on
 distance/path-length grounds alone and only discover the deficit during
 execution; B3's certificate should predict that Level 1/2 cannot fix P_A (the
-deficit is static, not dynamic -- Theorem 3's "T_dyn(p) = empty" case) and
+deficit is static, not dynamic, so it persists at every retiming factor up to
+lam_max -- the bounded-retiming-exhausted case Theorem 3's sufficient
+condition m*_1(p) < m_safe is built to detect; this does NOT establish the
+idealized T_dyn(p) = empty itself, only that the implemented retiming class
+cannot fix it, per Theorem 3's own statement) and
 reroute to P_B before execution begins -- while still reaching the SAME task
 goal, not a different, easier one.
 
@@ -89,7 +93,7 @@ def run():
         results[name] = m
         levels = sorted(set(str(l) for l in rr.levels))
         print(f"{name}: success={m.task_success} (final_pos_error={m.final_pos_error_m:.3f} m), "
-              f"levels={levels}, sat_events={m.saturation_events}, "
+              f"levels={levels}, sat_samples={m.saturation_samples}, "
               f"peak_tau_ratio={m.peak_torque_ratio:.2f}, replans={m.replans}")
     return results
 

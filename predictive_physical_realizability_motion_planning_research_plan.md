@@ -1059,7 +1059,7 @@ Use:
 \text{collision rate}\\
 \text{fall/failure rate}\\
 \text{minimum actuator margin}\\
-\text{number of saturation events}\\
+\text{number of saturation samples}\\
 \text{tracking error}\\
 \text{minimum obstacle clearance}\\
 \text{replanning count}\\

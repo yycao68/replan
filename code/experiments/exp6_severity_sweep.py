@@ -29,7 +29,7 @@ SEVERITIES = [0.0, 1.5, 2.5, 3.5, 5.0, 8.0]
 
 
 def run():
-    print(f"{'payload':>8} | {'level(s) used':>18} | {'success':>8} {'sat_events':>10} {'replans':>8}")
+    print(f"{'payload':>8} | {'level(s) used':>18} | {'success':>8} {'sat_samples':>10} {'replans':>8}")
     for payload in SEVERITIES:
         arm = Arm.create()
         arm.set_payload_mass(payload)
@@ -53,7 +53,7 @@ def run():
         m = M.compute(rr, goal_pos)
         levels = sorted(set(str(l) for l in rr.levels))
         print(f"{payload:8.1f} | {str(levels):>18} | {str(m.task_success):>8} "
-              f"{m.saturation_events:10d} {m.replans:8d}")
+              f"{m.saturation_samples:10d} {m.replans:8d}")
 
 
 if __name__ == "__main__":

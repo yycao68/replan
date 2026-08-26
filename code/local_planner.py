@@ -50,6 +50,17 @@ class PlannerConfig:
     horizon_steps: int = 15
     lam_max: float = 4.0
     qddot_box: float = 8.0  # rad/s^2, kinematic bound used by Level-2 QP
+    # Level-2 reshape QP objective weights (see _try_reshape): the cost
+    # penalizes deviation from the NOMINAL q/qdot/qddot, not raw magnitude, so
+    # the QP picks the closest physically realizable trajectory rather than
+    # whatever minimizes acceleration. w_acc dominates because the deficit
+    # the QP exists to fix is a torque violation, which only qddot controls
+    # directly; w_pos/w_vel are smaller secondary terms that discourage
+    # compounding position/velocity drift once qddot has some freedom to
+    # choose among several feasible corrections.
+    reshape_w_acc: float = 1.0
+    reshape_w_pos: float = 0.1
+    reshape_w_vel: float = 0.1
     predict: bool = True
     act: bool = True
     allow_level1: bool = True
@@ -226,7 +237,7 @@ class LocalPlanner:
 
         best_effort = None
         if cfg.allow_level2:
-            reshaped = self._try_reshape(Q, Qdot, forces)
+            reshaped = self._try_reshape(Q, Qdot, Qddot, forces)
             if reshaped is not None:
                 Qn, Qdotn, Qddot2 = reshaped
                 m2 = self.cert.m_phys(Qn, Qdotn, Qddot2, forces)
@@ -257,7 +268,7 @@ class LocalPlanner:
         return PlanResult(4, Qk, Qdotk, Qddotk, m0, mk, triggered=True)
 
     # ------------------------------------------------------------------
-    def _try_reshape(self, Q, Qdot, forces):
+    def _try_reshape(self, Q, Qdot, Qddot, forces):
         """Level 2: convex QP over the horizon's acceleration profile.
 
         Q_new/Qdot_new are explicit double-integrator STATE variables,
@@ -283,6 +294,15 @@ class LocalPlanner:
         not an exact one -- the same approximation the unmodified code
         already made, just no longer paired with a state trajectory that
         can't actually result from the returned accelerations.
+
+        The objective penalizes deviation from the nominal Q/Qdot/Qddot
+        (weights: PlannerConfig.reshape_w_pos/reshape_w_vel/reshape_w_acc),
+        not raw acceleration magnitude -- a bare minimize-||qddot|| objective
+        has no reason to prefer a reshaped trajectory that stays close to the
+        one the planner originally intended, and could pick an equally
+        feasible but arbitrarily different motion (found during a code-vs-
+        paper review). This is a 'closest physically realizable trajectory'
+        objective, not a minimum-effort one.
         """
         cfg = self.cfg
         n = Q.shape[0]
@@ -308,7 +328,9 @@ class LocalPlanner:
                                      + 0.5 * dt**2 * qddot_vars[j],
                     qdot_vars[j + 1] == qdot_vars[j] + dt * qddot_vars[j],
                 ]
-            cost += cp.sum_squares(qddot_vars[j])
+            cost += cfg.reshape_w_acc * cp.sum_squares(qddot_vars[j] - Qddot[j])
+            cost += cfg.reshape_w_pos * cp.sum_squares(q_vars[j] - Q[j])
+            cost += cfg.reshape_w_vel * cp.sum_squares(qdot_vars[j] - Qdot[j])
         prob = cp.Problem(cp.Minimize(cost), constraints)
         try:
             prob.solve(solver=cp.OSQP, verbose=False)

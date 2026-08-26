@@ -54,7 +54,7 @@ def run():
             goal_pos = arm.ee_position(QF)
             m = M.compute(rr, goal_pos)
             row[name] = m
-            saturated = m.saturation_events > 0
+            saturated = m.saturation_samples > 0
             if saturated and first_violation.get(name) is None and name in ("B1", "B2"):
                 first_violation[name] = payload
             if name == "B3":
@@ -75,9 +75,9 @@ def run():
                         n_conservative += 1
         b1, b2, b3 = row["B1"], row["B2"], row["B3"]
         levels_str = ",".join(sorted(levels_seen))
-        print(f"{payload:8.1f} | {str(b1.saturation_events>0):>8} {str(b1.task_success):>8} | "
-              f"{str(b2.saturation_events>0):>8} {str(b2.task_success):>8} | "
-              f"{levels_str:>7} {str(b3.saturation_events>0):>8} {str(b3.task_success):>8} "
+        print(f"{payload:8.1f} | {str(b1.saturation_samples>0):>8} {str(b1.task_success):>8} | "
+              f"{str(b2.saturation_samples>0):>8} {str(b2.task_success):>8} | "
+              f"{levels_str:>7} {str(b3.saturation_samples>0):>8} {str(b3.task_success):>8} "
               f"{m0_min:9.2f}")
         rows.append(row)
 

@@ -57,7 +57,7 @@ Run `python3 run_all.py` from this directory.
   ablation of it via `PlannerConfig` flags) all share one computed-torque tracking
   controller and one MuJoCo plant, differing only in what reference they feed it
   -- the fairness point Sec. VIII-A insists on for B2 vs. B3.
-- `metrics.py` -- task success, saturation events, tracking error, and the
+- `metrics.py` -- task success, saturation samples, tracking error, and the
   conservatism check (Sec. VIII-I): whether a certificate trigger corresponded to
   an actual ground-truth torque-limit violation of the *un-adapted* nominal
   trajectory, or was a false positive.
@@ -124,9 +124,9 @@ since only the latter is actually subject to the 20ms (50 Hz) real-time budget.
   (unchanged by the Level-4 fix below -- detection timing is independent of
   what happens afterward). All three still fail the task at this force
   magnitude, but B3's *character* of failure changed once Level 4 was fixed to
-  actually hold position (see "What this is" above): saturation events dropped
-  from 39 to **20**, and tracking error against its own (now sensible, static)
-  reference collapsed from 671.78 mrad to **1.60 mrad** -- it isn't chasing a
+  actually hold position (see "What this is" above): saturation samples dropped
+  from 39 to **19**, and tracking error against its own (now sensible, static)
+  reference collapsed from 671.78 mrad to **1.49 mrad** -- it isn't chasing a
   moving target anymore, it's genuinely stopped. This README used to flag an
   "unexplained non-monotonicity" here (B3 sometimes showing *more* saturation
   events than B1/B2 at intermediate force magnitudes, 37-40N) as an open item.
@@ -156,7 +156,7 @@ since only the latter is actually subject to the 20ms (50 Hz) real-time budget.
   Exp 3, B3 is given this contact model at planning time. B2 (reactive) first
   responds only once already in contact, t=0.70s; **B3 responds at t=0.42s**,
   before the transition, and -- after the Level-4 fix -- finishes with **zero
-  saturation events** (previously reported as 9, before Level 4 was fixed to
+  saturation samples** (previously reported as 9, before Level 4 was fixed to
   actually hold rather than crawl) **vs. 27 for B1 and 8 for B2**. B2's number
   dropped from a previously-reported 29 once its one-step throttle became a
   genuine torque-feasible QP projection instead of a heuristic uniform scale
@@ -175,14 +175,16 @@ since only the latter is actually subject to the 20ms (50 Hz) real-time budget.
   `trajectory.ViaPointTrajectory`.) P_A passes through a near-singular,
   outstretched via-point under a 4.5 kg payload; B1 and B2 attempt it and
   never reach the shared goal (peak torque ratio 1.00, final position error
-  0.94 m and 0.82 m respectively, 45/54 saturation events -- B2's error grew
+  0.94 m and 0.82 m respectively, 45/54 saturation samples -- B2's error grew
   from a previously-reported 0.10 m once its throttle became a genuine
   torque-feasible QP projection instead of a heuristic scale that, on this
   scenario, happened to permit more motion than it actually certified as
   safe; see "What this is" above). B3's certificate
   predicts the deficit before execution (persists even at 8x retiming --
-  Theorem 3's `T_dyn(p) = empty` case), reroutes to P_B, and reaches the
-  IDENTICAL goal with **0.001 m final error and zero saturation events**,
+  the bounded-retiming-exhausted case Theorem 3's sufficient condition
+  `m*_1(p) < m_safe` is built to detect, not a proof of the idealized
+  `T_dyn(p) = empty` itself), reroutes to P_B, and reaches the
+  IDENTICAL goal with **0.001 m final error and zero saturation samples**,
   `replans=1`. This is the paper's central claim (Theorem 3) exercised end to
   end, on a genuine same-goal route comparison.
 - **Exp 6 (severity sweep):** reuses Exp 5's exact same-goal P_A/P_B geometry
@@ -203,7 +205,7 @@ since only the latter is actually subject to the 20ms (50 Hz) real-time budget.
 - **Ablation batch A1-A5:** run on two scenarios chosen because they're known to
   need different levels of the hierarchy. On Exp 2's 2.4 kg crossover
   ("retime-suffices"): **A3 (predict, don't act) is bit-for-bit identical to A1
-  (no prediction at all)** -- same level trace, same 10 saturation events, same
+  (no prediction at all)** -- same level trace, same 10 saturation samples, same
   failure -- a clean, exact confirmation that prediction alone has zero value
   unless something acts on it. A2 and A4/A5 all succeed here (consistent with
   Exp 2's finding above that this scenario doesn't separate reactive from
@@ -211,12 +213,37 @@ since only the latter is actually subject to the 20ms (50 Hz) real-time budget.
   ("reroute-required", same same-goal fix as Exp 5/6 above): **A4 (predict +
   retime/reshape, no reroute or brake) fails** -- it does trigger Level 2
   reshaping (`levels=['0','2']`) but ends up with a final position error of
-  0.98 m, effectively no better than A1's 0.94 m (47 vs. 45 saturation
-  events) -- while **A5 (the full architecture) succeeds cleanly via Level 3**,
-  reaching the identical goal with 0.001 m error and zero saturation events.
+  1.35 m, actually worse than A1's 0.94 m (53 vs. 45 saturation samples --
+  since the Level-2 objective change below, reshaping-without-rerouting no
+  longer merely fails to help here, it fails more than doing nothing) --
+  while **A5 (the full architecture) succeeds cleanly via Level 3**,
+  reaching the identical goal with 0.001 m error and zero saturation samples.
   This is exactly the isolation the paper's own Sec. VIII-H text asks for:
   rerouting's marginal contribution, shown on the one scenario nothing short
   of it can fix.
+- **Level-2 (reshape) objective now penalizes deviation from the nominal
+  trajectory, not raw acceleration magnitude** (found during a code-vs-paper
+  review): the QP previously minimized `sum(qddot^2)`, which has no reason to
+  prefer a reshaped motion close to the one the planner originally intended --
+  it just prefers small accelerations, which happens to correlate with margin
+  but is not the same thing as "closest physically realizable trajectory."
+  The objective is now `w_acc*sum((qddot-qddot_nom)^2) +
+  w_pos*sum((q-q_nom)^2) + w_vel*sum((qdot-qdot_nom)^2)`
+  (`PlannerConfig.reshape_w_acc/w_pos/w_vel`, defaults 1.0/0.1/0.1). This is a
+  genuine behavior change, not just a relabeling: staying close to the
+  nominal acceleration is not always compatible with restoring margin, and on
+  the `test_reshape_qp_solves_online_and_respects_bounds` scenario the
+  reshape QP that used to succeed (`m_after=5.62`) now finds a nominal-close
+  candidate the nonlinear certificate rejects (`m_after=0.95 < m_safe=2.0`),
+  so the planner correctly falls through to Level 4 instead -- an honest
+  consequence of the fix, not a regression the test hides (the test's own
+  pass/fail assertion is conditional on `level==2` and still passes; it is no
+  longer exercising a successful Level-2 outcome, which is itself worth
+  flagging as a coverage gap rather than silently accepted). The same change
+  is why the ablation-batch A4 numbers above (0.98 m/47 -> 1.35 m/53) and
+  Exp 3's B3 numbers (20/1.60 mrad -> 19/1.49 mrad, `replans` 2 -> 1) moved
+  from what was previously reported here -- both updated in this README, and
+  in the paper draft, to match a fresh rerun after the fix.
 - **Real-time timing benchmark (Sec. VIII-J):** on Exp 1's nominal trajectory,
   B3's online per-cycle step easily fits the 20ms/50Hz budget (mean 0.27ms, max
   under 0.5ms across repetitions) -- unsurprising, since Level 0 (do nothing)

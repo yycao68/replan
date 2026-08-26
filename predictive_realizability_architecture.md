@@ -194,7 +194,7 @@ Complementary diagnostic signals: directional authority $\alpha_{dir}(k+j)$ (rem
 
 > ⚠️ **Resourcing risk (from review, unresolved).** No legged/humanoid simulation or hardware pipeline has surfaced in this line of work — everything to date (DI-QP, HAE, pHRI) is FR3 fixed-base. Phase II/III need a floating-base, contact-scheduled dynamics model architecturally distinct from the double-integrator backbone underlying everything else here. **Get an honest build-cost estimate before treating Phase II/III as required** — plausibly 6–12 months, not "one more scenario."
 
-**Comparison metrics (full set):** task success rate, collision rate, fall/failure rate, minimum actuator margin, number of saturation events, tracking error, minimum obstacle clearance, replanning count, replanning latency, local-planner computation time, global-planner invocation rate, **conservatism**.
+**Comparison metrics (full set):** task success rate, collision rate, fall/failure rate, minimum actuator margin, number of saturation samples, tracking error, minimum obstacle clearance, replanning count, replanning latency, local-planner computation time, global-planner invocation rate, **conservatism**.
 
 > The **conservatism** metric matters most and is easy to omit by accident: an overly conservative certificate can trivially prevent failure by stopping the robot everywhere, which would make every other safety metric look perfect while the system is useless. It must be reported alongside every safety claim, not as an afterthought.
 
