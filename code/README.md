@@ -71,9 +71,10 @@ confirming that a pure static (gravity-only) torque deficit is *not* fixable by
 retiming, only by reshaping/rerouting/braking, which is what the paper's own
 Level-1 discussion implies should happen.
 
-All six of `experiments/exp1_baseline.py` through `exp6_severity_sweep.py`, plus
-`experiments/ablation_batch.py` (A1-A5, Sec. VIII-H), are implemented and
-runnable, with results below from an actual run (not fabricated -- rerun
+All seven of `experiments/exp1_baseline.py` through
+`exp7_environment_conditioned_reroute.py`, plus `experiments/ablation_batch.py`
+(A1-A5, Sec. VIII-H), are implemented and runnable, with results below from an
+actual run (not fabricated -- rerun
 `run_all.py` to reproduce). Getting Exp 3/4 correct required extending the force
 interface from a constant `(2,)` value to a callable `ee_force_fn(t, q) ->
 force`, since Exp 3 needs a purely time-based schedule (ramp onset) while Exp 4
@@ -94,6 +95,23 @@ computation time directly, wrapping each baseline's policy call with
 `time.perf_counter()` -- B3's ONE-TIME route-planning cost (Level 1/3, a whole-
 route search) is timed separately from its PER-CYCLE online cost (Level 0/2/4),
 since only the latter is actually subject to the 20ms (50 Hz) real-time budget.
+
+`experiments/exp7_environment_conditioned_reroute.py`, added in a follow-up
+review pass, closes a gap the reviewer identified directly: Exp 5's flagship
+reroute is triggered by a configuration/payload deficit (an outstretched
+via-point under a heavy payload), and Exp 4 shows adaptation to a known
+contact transition but only ever gives the planner one route -- neither shows
+rerouting *because of the environment specifically*. Exp 7 reuses Exp 4's
+scripted contact-stiffness model (a virtual plane, penetration-proportional
+force via `xfrc_applied`) but gives the planner two routes to the same goal,
+as in Exp 5: P_A's via-point dips the end-effector below the contact plane,
+P_B's stays clear of it. See "Real results" below for the numbers; the
+distinguishing feature by design is that VIA_A's static margin (no force) is
+healthy under the light payload used here -- unlike Exp 5, the deficit exists
+only once the known environmental force is accounted for, and (like Exp 5's
+static deficit) is retiming-proof for the analogous reason: the spring force
+is a function of position only, evaluated at the via-point's own zero-
+velocity/zero-acceleration boundary, so slowing down does not reduce it.
 
 ## Real results from the current implementation
 
@@ -202,6 +220,25 @@ since only the latter is actually subject to the 20ms (50 Hz) real-time budget.
   contribution over Level 1 is not yet demonstrated by these experiments. That
   would need a scenario engineered so retiming is provably insufficient but a
   *non-uniform* acceleration change is not -- not yet constructed here.
+- **Exp 7 (environment-conditioned reroute):** P_A and P_B share q0/qf as in
+  Exp 5, but here VIA_A's static margin under the (light, 1.0 kg) payload
+  alone is healthy (**9.87 Nm**) -- the deficit exists only once the known
+  contact-plane force is included (**-20.22 Nm**), and VIA_B's margin never
+  needs the force accounted for since its path never enters the field
+  (**8.63 Nm**, no force). The certificate's own bounded retiming search
+  confirms this is retiming-proof, exactly as designed. B1 and B2 both attempt
+  P_A, saturate through the contact region (peak torque ratio 1.00, 40 and 44
+  saturation samples), and fail to reach the goal (**0.234 m** and **0.366 m**
+  final error -- B2 slightly worse than B1 here, an unflattering but real
+  finding reported rather than smoothed over, plausible since B2's one-step
+  reactive projection has no lookahead into the field it's already
+  entering). B3, given the same contact model at planning time
+  (`force_known_at_plan_time=True`), predicts P_A's margin before ever
+  entering the field, reroutes to P_B, and reaches the identical goal with
+  **0.000 m error and zero saturation samples**, `replans=1`. This is the
+  isolation the flagship result (Exp 5) does not by itself provide:
+  rerouting driven by the environment specifically, not by configuration or
+  payload.
 - **Ablation batch A1-A5:** run on two scenarios chosen because they're known to
   need different levels of the hierarchy. On Exp 2's 2.4 kg crossover
   ("retime-suffices"): **A3 (predict, don't act) is bit-for-bit identical to A1
