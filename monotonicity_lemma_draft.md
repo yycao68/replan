@@ -1,6 +1,6 @@
 # Retiming Monotonicity: Decomposition, a Checkable Sufficient Condition, and a Fallback
 
-**Status:** Draft lemma, written for direct reuse in the narrower saturation-certificate paper (targeting SCL/L-CSS) that `predictive_realizability_paper_draft.md`'s Draft Status item 6 identifies as the next concrete step. Not yet submission-polished; notation matches the main draft's Theorem 3 (§VI) so it can be pasted in with minimal rework. Raised in review, verified against the actual reduced-order implementation (`code/local_planner.py`) before being trusted — see the empirical section at the end.
+**Status:** The Lemma (§3) and its empirical grounding (§5) have now been folded directly into `predictive_realizability_paper_draft.md`'s §VI, immediately after Theorem 3's proof, using the sign-condition/dense-scan-fallback version (§4(a)) — not the closed-form exact fallback (§4(b)) below, which remains unimplemented. This file remains the source material and is still where the closed-form fallback is being developed for direct reuse in the narrower saturation-certificate paper (targeting SCL/L-CSS) that the main draft's Draft Status item 6 identifies as the next concrete step. Notation matches the main draft's Theorem 3 (§VI). Raised in review, verified against the actual reduced-order implementation (`code/local_planner.py`) before being trusted — see the empirical section at the end.
 
 ---
 
