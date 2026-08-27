@@ -113,6 +113,101 @@ static deficit) is retiming-proof for the analogous reason: the spring force
 is a function of position only, evaluated at the via-point's own zero-
 velocity/zero-acceleration boundary, so slowing down does not reduce it.
 
+`local_planner.LocalPlanner._search_reshape_whole_route`, added in a further
+follow-up pass, closes the gap the paper's own Sec. V-C flagged as an open
+item: `plan_route` previously tried only retiming (Level 1) as route-level
+regeneration before falling back to reroute (Level 3) -- reshaping (Level 2)
+was tried online only, per control cycle, never at the route-planning
+decision itself. Reshape and retime are both genuine regeneration of the
+SAME route; only rerouting changes route entirely, so `plan_route`'s order
+is now retime, then reshape, then reroute, symmetrically on both the primary
+and (if reached) the alternate route. `_try_reshape` gained an optional
+terminal-state constraint (`terminal_q`/`terminal_qdot`) so a whole-route
+reshape is pinned to reach the SAME goal at rest, not free to drift to a
+different final configuration -- the goal-changing failure mode this
+codebase already fixed once for Level 3 (see Exp 5's docstring), reopened
+for Level 2 if left unconstrained. The reshaped route is wrapped in a new
+`trajectory.SampledTrajectory` (piecewise-quadratic reconstruction of the
+QP's own double-integrator propagation, so `sample(t)` is an exact, not
+approximate, reconstruction -- unit-tested directly in `trajectory.py`) so
+it drops into `online_step`/`rollout`/a further retime search like any other
+trajectory. Three things were checked empirically before trusting this,
+not assumed: (1) whole-route reshape genuinely CANNOT resolve Exp 5's
+flagship or Exp 7's environment-conditioned deficit either (confirmed
+against SCS as an independent solver, not just OSQP's own status flag --
+see below), so Level 3 remains genuinely necessary in both of this
+benchmark's existing reroute-required scenarios, not merely because reshape
+was never tried; (2) a scenario DOES exist where reshape succeeds where
+retiming cannot (`tests/test_planner.py`'s
+`test_route_level_reshape_restores_feasibility_when_retiming_cannot`) --
+interestingly, not by geometrically routing AROUND the force field (the
+reshaped path's minimum end-effector height is, if anything, lower than the
+nominal path's), but by reallocating velocity/timing WITHIN the same total
+route duration, a genuinely different mechanism from retiming's uniform
+global time-scaling; (3) this whole-route QP is large enough that OSQP does
+not reliably converge on it (see the real-time cost finding below), so
+`_try_reshape` now falls back to SCS on OSQP's failure, confirmed necessary
+by direct testing, not adopted speculatively.
+
+### Non-monotonic retiming margin: a real bug in `_search_retime_whole_route`, found and fixed
+
+Raised as a theoretical concern in a review of the paper draft, not found by
+code inspection first: per joint, torque under uniform time-dilation by
+`lambda` decomposes as `tau(lambda) = A/lambda**2 + B`, where `A` is the
+inertial/Coriolis contribution (evaluated at the same path fraction, so `A`
+itself is independent of `lambda`) and `B = g(q) + J^T F_ext(q)` is the
+velocity-independent (gravity + position-only external force) contribution,
+unchanged by retiming. `m_phys(lambda)` is monotonically non-decreasing in
+`lambda` -- what the old bisection search assumed without checking -- only
+when `sign(A_i) == sign(B_i)` for the binding joint at every `lambda` tested.
+When some joint's inertial/Coriolis torque OPPOSES its gravity/external-force
+torque (e.g. decelerating a downswing partially unloads gravity-holding
+torque), `A/lambda**2 + B` can cross zero at a finite `lambda*` and grow
+again beyond it, so `m_phys(lambda)` is genuinely non-monotonic.
+
+This was checked directly against the code, not just algebraically: a random
+search over 3000 (q0, qf, T, payload) draws on this platform found 23 cases
+(~0.8%) of the exact failure mode that matters -- `_search_retime_whole_route`
+checks only `lambda_max`, and if that alone fails, returned `None`
+("retiming exhausted, proceed to reroute") even when a dense scan shows an
+INTERIOR `lambda`, sometimes far from `lambda_max`, actually restores the
+margin:
+
+```
+trial=26   m0(lambda=1)=-1.51   old code: None (declares retiming exhausted)
+           dense scan: max m_phys=2.86 (>= m_safe=2.0) at lambda=1.55
+           m_phys(lambda_max=4.0)=1.66 (< m_safe) -- the only point old code checked
+trial=146  m0(lambda=1)=-82.58  old code: None
+           dense scan: max m_phys=2.06 (>= m_safe=2.0) at lambda=3.50
+           m_phys(lambda_max=4.0)=1.80 (< m_safe)
+```
+
+Fixed: `_search_retime_whole_route` keeps the fast bisection path when
+`lambda_max` alone clears `m_safe` (unaffected, same cost as before), but no
+longer gives up immediately when it doesn't -- it dense-scans 41 points
+across `[1, lambda_max]`, and if any clear `m_safe`, refines the bracket
+around the first crossing with a local bisection (valid there even though
+the function isn't globally monotonic) rather than assuming the interval is
+hopeless. Verified directly: both trials above now correctly return a
+rescuing `lambda` (1.216 and 3.452 respectively, each landing exactly at
+`m_phys = m_safe = 2.00`).
+
+**This does not change any number already reported in this paper.** The two
+scenarios whose Theorem-3 conclusion is actually cited (Exp 5's flagship,
+Exp 7's environment-conditioned reroute) were checked with a dense scan
+before and after the fix: the flagship's `m_phys(lambda)` is genuinely
+monotonic there (sup is at `lambda_max`, as assumed), and Exp 7's is
+technically non-monotonic but the interior deviation (~0.5) is negligible
+against how far below `m_safe` it stays (~-20) -- neither conclusion
+flips. The bug is real and reproducible, but it was a soundness gap in the
+implementation, not a corrupted result. It does, however, make retiming
+itself more expensive on scenarios that hit the new fallback: on the
+timing-benchmark stress case (which was already known to fail lambda_max's
+check), retime-only rose from ~3ms to ~63ms -- still two orders of
+magnitude cheaper than reshape's 300-900ms, so the qualitative real-time
+story is unchanged, but the specific retime-only baseline number moved and
+is updated above and in the timing benchmark's own output.
+
 ## Real results from the current implementation
 
 - **Exp 1 (no-regression check):** B1/B2/B3 are bit-for-bit identical on a benign
@@ -164,11 +259,16 @@ velocity/zero-acceleration boundary, so slowing down does not reduce it.
   pose if the current one stops being tenable, or coupling it to Level 3
   (reroute to a genuinely better configuration instead of freezing wherever
   the trigger first fired). A parameter sweep still confirms B3 fully avoids
-  failure at low force magnitudes (<=25N, matching B1/B2 there -- not a
-  differentiator) and, past ~30N, B3 fails the task via a permanent hold
+  failure at low force magnitudes (<=24N, matching B1/B2 there -- not a
+  differentiator) and, from 25N on, B3 fails the task via a permanent hold
   (Level 4 has no resume path) even at magnitudes B1/B2 still complete despite
   transient saturation -- a real, honest safety-vs-completion trade-off, not
-  a strict win for either side.
+  a strict win for either side. (Re-verified directly during a full-codebase
+  review: the earlier-reported "<=25N safe / past ~30N fails" thresholds were
+  off by one sample point and overstated the safe margin by several N; the
+  boundary is confirmed independent of the Level-2 route-level-reshape work
+  above -- identical with Level 2 disabled entirely, so this predates that
+  change rather than being caused by it.)
 - **Exp 4 (contact-stiffness transition, known in advance):** a scripted contact
   force turns on once the end-effector descends past a virtual plane; unlike
   Exp 3, B3 is given this contact model at planning time. B2 (reactive) first
@@ -328,6 +428,36 @@ velocity/zero-acceleration boundary, so slowing down does not reduce it.
   that mixed the nominal route's positions with different accelerations (see
   `_try_reshape`'s docstring) -- a correctness fix, not a performance one,
   and it makes the pre-existing over-budget finding above worse, not better.
+
+  **Route-level reshape (below) adds a large one-time route-planning cost,
+  paid regardless of whether it succeeds.** `plan_route` now tries reshape
+  over the WHOLE route -- not just the online horizon -- before falling back
+  to reroute, and this is a much bigger QP (n scales with route duration/dt,
+  not the fixed online horizon). On the timing benchmark's stress case (Exp
+  5's near-singular goal, no alt route, so the route decision runs retime
+  then reshape then gives up): route planning went from **~3ms (retime
+  only) to ~300ms** with reshape enabled, confirmed by a controlled
+  before/after comparison, not inferred from noise. The cause: OSQP does not
+  reliably converge on a QP this size within a practical iteration budget
+  (hits `user_limit` even at `max_iter=50000` in direct testing), so
+  `_try_reshape` falls back to SCS, which does converge cleanly but is
+  itself not fast. (The retime-only baseline itself later moved to ~63ms
+  on this same scenario, still far below reshape's cost, once
+  `_search_retime_whole_route`'s own dense-grid fallback below was added --
+  see "Non-monotonic retiming margin" further down -- since this scenario's
+  lambda_max check alone fails and now correctly triggers a wider search
+  instead of giving up immediately.) This cost is paid whether reshape
+  ultimately succeeds or fails -- on Exp 5's flagship and Exp 7's
+  environment-conditioned scenario (both of which still correctly require
+  Level 3, confirmed against an independent solver, not just OSQP's status
+  flag) it is pure overhead before the reroute decision; on scenarios where
+  it succeeds (see the new
+  `test_route_level_reshape_restores_feasibility_when_retiming_cannot`) it
+  is the cost of the improvement. It remains a ONE-TIME, pre-execution cost
+  (not compared against the 20ms per-cycle budget), but at FR3-scale route
+  durations this could become the dominant term in "how long before the
+  robot starts moving," which is worth disclosing plainly rather than
+  leaving implicit in the per-cycle numbers above.
 
 ## Known simplifications (stated once, applies throughout)
 

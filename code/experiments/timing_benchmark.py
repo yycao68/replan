@@ -12,7 +12,7 @@ nothing to time.
 
 For B3, two distinct costs are reported separately, since only one of them is
 actually subject to the real-time budget:
-  - "route planning" (Level 1/3): a ONE-TIME cost paid once per rollout, when
+  - "route planning" (Level 1/2/3): a ONE-TIME cost paid once per rollout, when
     plan_route searches the whole candidate route(s) (Sec. V-B/V-C's design:
     this is a planning-time decision, not a per-cycle one -- see
     local_planner.py's module docstring). Not compared against the cycle budget.
@@ -103,9 +103,9 @@ def _run_scenario(scenario_name, Q0, QF, T, payload, alt_traj_fn=None, repeats=5
     times2, per_rep2 = _timed_repeats(make_b2, Q0, np.zeros(3), duration, DT, repeats)
     _report("B2 online step ", _stats_ms(times2), per_rep2)
 
-    # B3: full predictive architecture. Route planning (one-time, Level 1/3) is
-    # timed on a single instance; the online per-cycle step (Level 0/2/4) is
-    # pooled over repeats like B2, since that's the number subject to noise.
+    # B3: full predictive architecture. Route planning (one-time, Level 1/2/3)
+    # is timed on a single instance; the online per-cycle step (Level 0/2/4)
+    # is pooled over repeats like B2, since that's the number subject to noise.
     arm3 = Arm.create(); arm3.set_payload_mass(payload)
     traj3 = JointTrajectory(Q0, QF, T=T)
     cert3 = Certificate(arm=arm3, m_safe=2.0)
@@ -113,8 +113,29 @@ def _run_scenario(scenario_name, Q0, QF, T, payload, alt_traj_fn=None, repeats=5
     t0 = time.perf_counter()
     policy_b3(traj3, arm3, cert3, PlannerConfig(), alt_traj=alt_traj)
     route_planning_s = time.perf_counter() - t0
-    print(f"B3 route planning (one-time, Level 1/3): {route_planning_s*1000:.3f}ms "
+    print(f"B3 route planning (one-time, Level 1/2/3): {route_planning_s*1000:.3f}ms "
           f"(not compared against the per-cycle budget)")
+
+    # Diagnostic: route-level reshape (_search_reshape_whole_route) is a much
+    # larger QP than the online horizon's and needs an OSQP-then-SCS fallback
+    # to converge reliably (see local_planner.py); isolate its contribution to
+    # the ONE-TIME route-planning cost above, gated on that cost actually
+    # being large enough to matter (retime-only route decisions on a benign
+    # trajectory are already sub-ms and not worth re-measuring).
+    if route_planning_s * 1000 > 20.0:
+        arm3b = Arm.create(); arm3b.set_payload_mass(payload)
+        traj3b = JointTrajectory(Q0, QF, T=T)
+        cert3b = Certificate(arm=arm3b, m_safe=2.0)
+        alt_traj_b = alt_traj_fn() if alt_traj_fn else None
+        t0 = time.perf_counter()
+        policy_b3(traj3b, arm3b, cert3b, PlannerConfig(allow_level2=False), alt_traj=alt_traj_b)
+        route_planning_no_l2_s = time.perf_counter() - t0
+        print(f"  diagnostic: route planning with route-level reshape="
+              f"{route_planning_s*1000:.1f}ms vs. retime-only="
+              f"{route_planning_no_l2_s*1000:.1f}ms -- route-level reshape "
+              f"(the OSQP-then-SCS whole-route QP) accounts for "
+              f"~{100*(1 - route_planning_no_l2_s/route_planning_s):.0f}% "
+              f"of the one-time route-planning cost here.")
 
     def make_b3():
         arm = Arm.create(); arm.set_payload_mass(payload)

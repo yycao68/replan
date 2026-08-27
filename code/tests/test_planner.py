@@ -4,7 +4,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import numpy as np
 from dynamics import Arm
 from certificate import Certificate
-from trajectory import JointTrajectory
+from trajectory import JointTrajectory, ViaPointTrajectory
 from local_planner import LocalPlanner, PlannerConfig
 
 
@@ -159,6 +159,50 @@ def test_reroute_switches_to_alt_route_when_primary_infeasible():
     assert route.level == 3, f"expected the easy alt route to be accepted, got level {route.level}"
 
 
+def test_route_level_reshape_restores_feasibility_when_retiming_cannot():
+    """Positive case for _search_reshape_whole_route (Level 2 tried at ROUTE-
+    PLANNING time, not just online): a route through a known, position-
+    triggered force field (as in Exp 7) where retiming genuinely cannot help
+    (the deficit does not shrink with speed) but reshaping can, by
+    reallocating velocity/timing WITHIN the same total duration rather than
+    routing around the field entirely (confirmed directly: the reshaped
+    route's minimum end-effector height is not shallower than the nominal
+    route's -- it still enters the field, just moves through it differently).
+    This is the one scenario in the current suite that exercises a
+    *successful* route-level Level-2 outcome, closing the coverage gap
+    flagged when the reshape objective was corrected to penalize deviation
+    from the nominal trajectory (see README)."""
+    Z_CONTACT = 0.55
+    K_CONTACT = 300.0
+
+    def contact_force(t, q, _probe=Arm.create()):
+        ee_z = _probe.ee_position(q)[1]
+        pen = Z_CONTACT - ee_z
+        return None if pen <= 0 else np.array([0.0, K_CONTACT * pen])
+
+    q0 = np.array([0.15, 0.0, 0.0])
+    qf = np.array([0.25, 0.0, 0.0])
+    via = np.array([0.90, 0.0, 0.0])
+    traj = ViaPointTrajectory(q0, via, qf, T1=1.2, T2=1.0)
+
+    arm = Arm.create()
+    arm.set_payload_mass(1.0)
+    cert = Certificate(arm=arm, m_safe=2.0)
+    cfg = PlannerConfig(allow_level1=True, allow_level2=True, allow_level3=False)
+    planner = LocalPlanner(arm, cert, cfg)
+
+    lam = planner._search_retime_whole_route(traj, contact_force)
+    assert lam is None, "expected this force-driven deficit to be retiming-proof"
+
+    route = planner.plan_route(traj, ee_force_fn=contact_force)
+    print(f"route-level reshape test: level={route.level}, m_phys={route.m_phys:.2f}")
+    assert route.triggered
+    assert route.level == 2, f"expected route-level reshape to succeed, got level {route.level}"
+    assert route.m_phys >= cert.m_safe - 1e-6
+    assert np.allclose(route.traj.q0, q0, atol=1e-3)
+    assert np.allclose(route.traj.qf, qf, atol=1e-3), "reshape must reach the SAME goal"
+
+
 if __name__ == "__main__":
     test_fast_heavy_route_falls_to_level4_when_only_that_is_allowed()
     test_retiming_restores_whole_route_feasibility_for_dynamic_deficit()
@@ -168,4 +212,5 @@ if __name__ == "__main__":
     test_brake_profile_starts_from_q_actual_not_nominal_sample()
     test_policy_b3_sticky_brake_holds_position_after_level4()
     test_reroute_switches_to_alt_route_when_primary_infeasible()
+    test_route_level_reshape_restores_feasibility_when_retiming_cannot()
     print("\nAll planner tests passed.")

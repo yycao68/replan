@@ -4,17 +4,38 @@ so every baseline/ablation shares one code path (the fairness point Sec. VIII-A
 insists on for B2 vs B3).
 
 Design note (simplification, documented honestly): route-level decisions --
-Level 1 (retime) and Level 3 (reroute) -- are resolved once, as a *planning-time*
-decision over the full candidate route(s), producing a (possibly new) active
-trajectory. Instant-level corrections -- Level 2 (reshape) and Level 4 (brake) --
-are resolved online, every control cycle, against whichever route is currently
-active. This split exists because a retimed reference is a full re-parameterization
-of the route's time law: correcting it only for a single instantaneous horizon
-window (and not persisting the slower schedule into subsequent cycles) does not
-actually slow the executed motion down -- an earlier version of this code made
-exactly that mistake, silently reference-tracking a "slowed" qdot/qddot against a
-q_ref that kept marching forward at the original pace. Reshape and brake do not
-have this problem (they don't change the time law), so they run online per-cycle.
+Level 1 (retime), Level 2 (reshape, ALSO tried once at route-planning time, in
+addition to online -- see below), and Level 3 (reroute) -- are resolved once,
+as a *planning-time* decision over the full candidate route(s), producing a
+(possibly new) active trajectory. Level 4 (brake) is the one response that
+only ever makes sense online, every control cycle, against whichever route is
+currently active. This split exists because a retimed reference is a full
+re-parameterization of the route's time law: correcting it only for a single
+instantaneous horizon window (and not persisting the slower schedule into
+subsequent cycles) does not actually slow the executed motion down -- an
+earlier version of this code made exactly that mistake, silently reference-
+tracking a "slowed" qdot/qddot against a q_ref that kept marching forward at
+the original pace.
+
+`plan_route`'s ordering is retime, then reshape, then reroute: both retiming
+and reshaping are genuine trajectory REGENERATION over the SAME route (same
+q0/qf), so both are tried, in that order, before ever escalating to a
+DIFFERENT route. This was previously only true of retiming -- reshaping was
+tried online only, so a route-level deficit retiming couldn't fix went
+straight to reroute even when reshaping the same route might have sufficed
+(the gap the paper's own Sec. V-C flags: "closing that expressiveness gap ...
+is identified as a concrete next step, not yet implemented"). Route-level
+reshape is a MATERIALLY larger QP than the online horizon's (n scales with
+route duration / dt, not the fixed online horizon_steps) and OSQP does not
+reliably converge on it within a practical iteration budget -- confirmed
+empirically, not assumed: a solver fallback to SCS is needed when OSQP hits
+its iteration limit (see _try_reshape), and even then this route-level check
+costs on the order of hundreds of ms to ~1s in the tested scenarios,
+regardless of whether it ultimately succeeds -- a real, disclosed one-time
+cost (see README/paper's real-time sections), not a per-cycle one. Reshape
+and brake, run purely online, do not have the re-parameterization problem
+above (they don't change the time law), so they still run per-cycle as
+before.
 
 What Level 3 does and does not do (also flagged in the paper's own Draft
 Status, §V-C "open item"): `plan_route` SELECTS between `traj` and an
@@ -41,7 +62,7 @@ import cvxpy as cp
 
 from dynamics import Arm, TAU_MAX, TAU_MIN, N_JOINTS
 from certificate import Certificate
-from trajectory import JointTrajectory
+from trajectory import JointTrajectory, SampledTrajectory
 
 
 @dataclass
@@ -72,7 +93,7 @@ class PlannerConfig:
 @dataclass
 class RouteDecision:
     traj: JointTrajectory
-    level: int  # 0 (nominal kept) | 1 (retimed) | 3 (rerouted)
+    level: int  # 0 (nominal kept) | 1 (retimed) | 2 (reshaped) | 3 (rerouted)
     m_phys: float
     triggered: bool
 
@@ -102,12 +123,27 @@ class LocalPlanner:
         ee_force_fn=None,
     ) -> RouteDecision:
         """ee_force_fn(t, q) -> force or None. Passing a non-None ee_force_fn here
-        means Level 1/3 are decided WITH KNOWLEDGE of the whole predicted force/
+        means Level 1/2/3 are decided WITH KNOWLEDGE of the whole predicted force/
         contact profile over the route -- appropriate when that profile is part of
         the 'predicted environment E' the paper's Sec. IV certificate is
         conditioned on (Exp 4: a known upcoming contact transition), not when it
         represents a disturbance that should only become visible within a bounded
-        online prediction horizon (Exp 3: see online_step instead)."""
+        online prediction horizon (Exp 3: see online_step instead).
+
+        Ordering: retime, then reshape, then reroute -- both forms of route-
+        level REGENERATION (retiming and reshaping) are tried, on the current
+        route and then on the alternate, before ever falling back to
+        rerouting. This closes the paper's own flagged open item (Sec. V-C):
+        the pre-execution adaptation class previously included only retiming,
+        so a deficit retiming can't fix (a function of position, not speed --
+        _search_retime_whole_route) went straight to reroute even when
+        reshaping the SAME route might have sufficed. Checked empirically on
+        both scenarios that currently demonstrate Level 3 in this benchmark
+        (Exp 5's flagship, Exp 7's environment-conditioned reroute): whole-
+        route reshape genuinely cannot restore either one's margin (confirmed
+        against an independent solver, not just OSQP's own status flag -- see
+        _try_reshape), so Level 3 remains genuinely necessary there, not an
+        artifact of never having tried reshape first."""
         cfg = self.cfg
         m0 = self._whole_route_margin(traj, ee_force_fn)
 
@@ -125,6 +161,12 @@ class LocalPlanner:
                 m1 = self._whole_route_margin(retimed, ee_force_fn)
                 return RouteDecision(retimed, 1, m1, triggered=True)
 
+        if cfg.allow_level2:
+            reshaped = self._search_reshape_whole_route(traj, ee_force_fn)
+            if reshaped is not None:
+                new_traj, m2 = reshaped
+                return RouteDecision(new_traj, 2, m2, triggered=True)
+
         if cfg.allow_level3 and alt_traj is not None:
             mb = self._whole_route_margin(alt_traj, ee_force_fn)
             if mb >= self.cert.m_safe:
@@ -135,6 +177,11 @@ class LocalPlanner:
                     retimed_b = alt_traj.retimed(lam_b)
                     mb1 = self._whole_route_margin(retimed_b, ee_force_fn)
                     return RouteDecision(retimed_b, 3, mb1, triggered=True)
+            if cfg.allow_level2:
+                reshaped_b = self._search_reshape_whole_route(alt_traj, ee_force_fn)
+                if reshaped_b is not None:
+                    new_traj_b, mb2 = reshaped_b
+                    return RouteDecision(new_traj_b, 3, mb2, triggered=True)
 
         # Nothing at route level restores feasibility; online Level 2/4 must cope.
         return RouteDecision(traj, 0, m0, triggered=True)
@@ -158,17 +205,63 @@ class LocalPlanner:
 
     def _search_retime_whole_route(self, traj: JointTrajectory, ee_force_fn):
         """This is the m*_1(p) computation from the paper's Theorem 3 (Sufficient,
-        checkable condition for rerouting necessity): checking only lam_max relies
-        on the theorem's stated (not proven for the general nonlinear case)
-        monotonicity assumption -- lam -> m_phys(retimed(lam)) non-decreasing --
-        which holds exactly whenever the deficit is purely static/gravity-driven
-        (the case the negative-case test below exercises) and is not guaranteed
-        to hold in general (adversarial Coriolis cross-terms are not ruled out)."""
+        checkable condition for rerouting necessity). Per joint, torque under
+        uniform time-dilation by lambda decomposes as tau(lambda) = A/lambda^2 + B,
+        where A is the inertial/Coriolis contribution (evaluated at the SAME path
+        fraction, so A itself does not depend on lambda -- only the 1/lambda^2
+        scaling does) and B = g(q) + J^T F_ext(q) is the velocity-independent
+        (gravity + position-only external force) contribution, unchanged by
+        retiming. m_phys(lambda) = min_i [tau_max_i - |A_i/lambda^2 + B_i| -
+        delta_tau_i] is monotonically non-decreasing in lambda -- the theorem's
+        stated assumption -- exactly when sign(A_i) == sign(B_i) for the binding
+        joint/step at every lambda tested (then |A_i/lambda^2+B_i| shrinks
+        monotonically toward |B_i| as lambda grows). When some joint's inertial/
+        Coriolis torque OPPOSES its gravity/external-force torque (e.g.
+        decelerating a downswing partially unloads gravity-holding torque),
+        A_i/lambda^2 + B_i can cross zero at a finite lambda* and grow again
+        beyond it, so m_phys(lambda) is genuinely non-monotonic -- confirmed
+        empirically, not just in principle: a random search over this platform's
+        own scenarios found this in ~1% of trials, including cases where checking
+        lambda_max ALONE (the fast path below) incorrectly reports retiming as
+        exhausted while an interior lambda, sometimes far from lambda_max,
+        actually restores the margin. This is a genuine soundness gap in a
+        bisection search that assumes monotonicity without checking it, found
+        during a full-codebase review and confirmed against the actual scenarios
+        reported in this paper's results (Sec. IX): neither the flagship nor the
+        environment-conditioned scenario's reported conclusion is affected (the
+        flagship's m_phys(lambda) is genuinely monotonic there; the environment-
+        conditioned scenario is technically non-monotonic but the interior
+        deviation is negligible relative to how far below m_safe it stays), but
+        the gap is real and is not assumed away here."""
         cfg = self.cfg
-        if self._whole_route_margin(traj.retimed(cfg.lam_max), ee_force_fn) < self.cert.m_safe:
-            return None  # even maximal slowdown cannot fix it (e.g. a pure static/
-                          # gravity torque deficit) -- Level 1 correctly fails
-        lo, hi = 1.0, cfg.lam_max
+        m_at_max = self._whole_route_margin(traj.retimed(cfg.lam_max), ee_force_fn)
+        if m_at_max >= self.cert.m_safe:
+            # Fast path: lambda_max alone already clears -- bisect for the
+            # smallest feasible lambda under the (here, unfalsified) assumption
+            # that reachability is monotonic on this branch.
+            lo, hi = 1.0, cfg.lam_max
+            for _ in range(20):
+                mid = 0.5 * (lo + hi)
+                if self._whole_route_margin(traj.retimed(mid), ee_force_fn) >= self.cert.m_safe:
+                    hi = mid
+                else:
+                    lo = mid
+            return hi
+
+        # lambda_max alone fails: do NOT assume monotonicity and give up --
+        # confirmed above that this specific inference is unsound in general.
+        # Dense-scan the interval for a rescuing interior lambda before
+        # concluding retiming is genuinely exhausted.
+        grid = np.linspace(1.0, cfg.lam_max, 41)
+        margins = np.array([self._whole_route_margin(traj.retimed(l), ee_force_fn) for l in grid])
+        feasible = margins >= self.cert.m_safe
+        if not np.any(feasible):
+            return None  # even the densely-sampled interval cannot fix it
+        j = int(np.argmax(feasible))  # first grid point that clears m_safe
+        # Refine between the last-infeasible and first-feasible grid points
+        # (bisection is locally valid there even though the function is not
+        # monotonic globally, since this bracket is confirmed to cross m_safe).
+        lo, hi = grid[max(j - 1, 0)], grid[j]
         for _ in range(20):
             mid = 0.5 * (lo + hi)
             if self._whole_route_margin(traj.retimed(mid), ee_force_fn) >= self.cert.m_safe:
@@ -176,6 +269,39 @@ class LocalPlanner:
             else:
                 lo = mid
         return hi
+
+    def _search_reshape_whole_route(self, traj: JointTrajectory, ee_force_fn):
+        """Level 2 tried at ROUTE-PLANNING time, not just online: reshape the
+        WHOLE route (not the bounded online horizon), pinned by
+        _try_reshape's terminal_q/terminal_qdot to reach the SAME goal traj
+        already does, at rest. This is the 'genuine trajectory regeneration
+        before rerouting' step Theorem 3's adaptation class did not
+        previously include (paper Sec. V-C's own flagged open item): retiming
+        cannot help a deficit that is a function of position, not speed (see
+        _search_retime_whole_route), but reshaping CAN, since it is free to
+        choose a different Q path entirely, not just a different time law
+        along the SAME path -- so this is checked only after retiming has
+        already failed (plan_route's ordering), not instead of it.
+
+        Returns (SampledTrajectory, margin) if a reshaped route clears
+        m_safe, else None. This is a materially larger QP than the online
+        horizon's (n scales with the WHOLE route duration, not
+        cfg.horizon_steps), but it is a one-time planning cost like the
+        retime search above, not a per-cycle one."""
+        cfg = self.cfg
+        n = int(np.ceil(traj.T / cfg.dt)) + 1
+        Q, Qdot, Qddot = traj.sample_horizon(0.0, cfg.dt, n)
+        ts = cfg.dt * np.arange(n)
+        forces = self._sample_forces(ts, Q, ee_force_fn)
+        reshaped = self._try_reshape(Q, Qdot, Qddot, forces,
+                                      terminal_q=traj.qf, terminal_qdot=np.zeros(N_JOINTS))
+        if reshaped is None:
+            return None
+        Qn, Qdotn, Qddotn = reshaped
+        m2 = self.cert.m_phys(Qn, Qdotn, Qddotn, forces)
+        if m2 < self.cert.m_safe:
+            return None
+        return SampledTrajectory(ts, Qn, Qdotn, Qddotn), m2
 
     # ---- online, per control cycle: Level 0 / 2 / 4 --------------------
     def online_step(
@@ -268,8 +394,19 @@ class LocalPlanner:
         return PlanResult(4, Qk, Qdotk, Qddotk, m0, mk, triggered=True)
 
     # ------------------------------------------------------------------
-    def _try_reshape(self, Q, Qdot, Qddot, forces):
+    def _try_reshape(self, Q, Qdot, Qddot, forces, terminal_q=None, terminal_qdot=None):
         """Level 2: convex QP over the horizon's acceleration profile.
+
+        terminal_q/terminal_qdot, if given, pin q_vars[-1]/qdot_vars[-1] to
+        those values -- used when this is called over a WHOLE route (route-
+        planning time, see _search_reshape_whole_route) rather than the
+        bounded online horizon, so the reshaped route is constrained to reach
+        the SAME goal the original route does, not merely whatever state
+        minimizes the cost. Without this, a whole-route reshape could
+        silently drift to a different final configuration -- exactly the
+        goal-changing failure mode this codebase's ViaPointTrajectory/exp5
+        fix already closed once for Level 3, reopened here for Level 2 if
+        left unconstrained.
 
         Q_new/Qdot_new are explicit double-integrator STATE variables,
         anchored at the true current state (Q[0]/Qdot[0]) and propagated
@@ -311,6 +448,10 @@ class LocalPlanner:
         q_vars = [cp.Variable(N_JOINTS) for _ in range(n)]
         qdot_vars = [cp.Variable(N_JOINTS) for _ in range(n)]
         constraints = [q_vars[0] == Q[0], qdot_vars[0] == Qdot[0]]
+        if terminal_q is not None:
+            constraints.append(q_vars[-1] == terminal_q)
+        if terminal_qdot is not None:
+            constraints.append(qdot_vars[-1] == terminal_qdot)
         cost = 0
         for j in range(n):
             M = self.arm.mass_matrix(Q[j])
@@ -333,9 +474,26 @@ class LocalPlanner:
             cost += cfg.reshape_w_vel * cp.sum_squares(qdot_vars[j] - Qdot[j])
         prob = cp.Problem(cp.Minimize(cost), constraints)
         try:
-            prob.solve(solver=cp.OSQP, verbose=False)
+            prob.solve(solver=cp.OSQP, verbose=False, max_iter=20000)
         except cp.error.SolverError:
-            return None
+            pass
+        if prob.status not in ("optimal", "optimal_inaccurate"):
+            # OSQP hits its iteration budget (status "user_limit") rather than
+            # converging on the larger whole-route problem this is also used
+            # for (n ~ route duration / dt, tens of steps, vs. the online
+            # horizon's ~15) -- found empirically while testing route-level
+            # reshape on the flagship scenario: OSQP alone reported
+            # user_limit even at max_iter=50000, while SCS solved the
+            # IDENTICAL problem to a clean "optimal" in well under a second,
+            # confirming this is a solver/scaling limitation, not genuine
+            # infeasibility. SCS is only tried on OSQP's failure path, so the
+            # common (small, fast-converging online horizon) case is
+            # unaffected; this is a one-time route-planning cost, not a
+            # per-cycle one, when it does trigger.
+            try:
+                prob.solve(solver=cp.SCS, verbose=False)
+            except cp.error.SolverError:
+                return None
         if prob.status not in ("optimal", "optimal_inaccurate"):
             return None
         Q_new = np.array([v.value for v in q_vars])
