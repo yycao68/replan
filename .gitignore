@@ -3,3 +3,13 @@ __pycache__/
 .DS_Store
 code/results/
 MUJOCO_LOG.TXT
+
+# FR3/MoveIt2/ROS2 workspace and staged MuJoCo SDK (Phase 0/1 infra work) --
+# large build artifacts and cloned third-party sources, not paper content.
+ros2_ws/
+mujoco_sdk/
+
+# Downloaded reference PDFs for citation verification -- third-party
+# copyrighted papers, not repo content.
+*.pdf
+!predictive_realizability_paper_draft.pdf
