@@ -208,6 +208,102 @@ magnitude cheaper than reshape's 300-900ms, so the qualitative real-time
 story is unchanged, but the specific retime-only baseline number moved and
 is updated above and in the timing benchmark's own output.
 
+### Closed-form retiming candidates: implemented, found a real gap between the theory and the actual dynamics, fixed it, and it turned out not to be a speedup
+
+The dense-grid fallback above was always meant to be a stopgap;
+`monotonicity_lemma_draft.md` Sec. 4(b) sketches an exact alternative: since
+`tau_i(lambda) = A_i/lambda**2 + B_i`, wherever `sign(A_i) != sign(B_i)` the
+interior extremum of `|tau_i(lambda)|` has a closed form (`lambda*_i =
+sqrt(A_i/-B_i)`), so the true supremum can in principle be checked at a
+finite candidate set instead of a grid. Implementing this directly (a first
+pass, `A/lambda**2 + B` exactly as derived "by the manipulator equation")
+and testing it against the actual code surfaced a real, previously
+undocumented gap: `models/planar3r.xml` gives every joint real viscous
+damping (`dof_damping=0.3`), which the idealized manipulator equation the
+Lemma is derived from does not include. Verified directly -- with
+`dof_damping` zeroed, the 2-term model reproduces `mj_inverse`'s actual
+torque to numerical precision at every `lambda` tested; with damping
+present (the model this benchmark actually uses), the 2-term model is off
+by several percent and growing with `lambda`, enough to occasionally flip
+a margin decision near `m_safe`.
+
+Fixed by extending the decomposition to a THIRD term: under retiming, a
+linear damping torque `-c*qdot` scales as `1/lambda` (not `1/lambda**2`),
+so the exact model is `tau_i(lambda) = A_i x**2 + D_i x + B_i` with
+`x = 1/lambda` -- a genuine quadratic in `x`, not an assumption about
+MuJoCo's specific passive-force implementation: `A_i`, `D_i`, `B_i` are
+recovered by fitting three `required_torque` evaluations at the same `q`
+with scaled velocity/acceleration (`x=0`, `x=0.5`, `x=1`) to the known
+functional form, so it is robust to whatever MuJoCo's internal numerics
+actually are. This closes the residual to ~0.02 Nm (consistent with the
+much smaller, genuinely non-quadratic Coulomb friction term,
+`dof_frictionloss=0.05`, which no closed polynomial form captures
+exactly). The candidate set itself generalizes correspondingly: each
+joint/step now contributes up to two zero-crossings (quadratic formula)
+plus the parabola's own vertex, mapped back to `lambda`, instead of one
+`lambda*_i`.
+
+**Honest result: this did not deliver a wall-clock speedup on this
+benchmark, and the reason is structural, not a modeling-accuracy issue.**
+Re-running the same 3000-scenario random search with the fixed model:
+
+```
+lambda_max alone already feasible:        1916/3000 (63.9%) -- no search needed
+needs the search (lambda_max infeasible): 1084/3000 (36.1%)
+  closed-form candidates sufficed:          21/1084  (1.9%)
+  dense-grid fallback still needed:       1063/1084 (98.1%)
+  of those, the fine (401-pt) grid found a
+  feasible lambda the closed-form set missed:  2 cases
+```
+
+This 1.9% hit rate is essentially unchanged from the naive (pre-damping-fix)
+2-term model's own 1.9% -- the damping fix genuinely closed a real physics
+gap (confirmed above), but it did not meaningfully improve how often the
+closed-form set alone suffices, because the actual bottleneck is a
+different, structural limitation documented in `local_planner.py`'s own
+docstring: the supremum of `m_phys(lambda) = min` over many per-(joint,step)
+curves can occur at a pairwise CROSSING point between two different curves,
+not at either curve's own extremum, and no per-curve closed form -- however
+accurate -- captures that. With a 3-DOF arm and dozens of route steps, a
+whole route contributes dozens of candidate curves, so this is the binding
+constraint, not curve-level accuracy. Timing confirms this directly: the
+closed-form path's own candidate-evaluation cost (computing `A,B,D` for
+every step, then evaluating the real whole-route margin at every candidate)
+is comparable to or larger than the 41-point dense grid's cost, so even
+when it succeeds it is not meaningfully cheaper --
+
+```
+lambda_max-alone-feasible search: mean=21.9ms, p95=32.6ms, max=75.4ms
+closed-form-sufficed search:      mean=96.2ms, p95=165.3ms, max=181.7ms
+dense-grid-fallback search:       mean=107.5ms, p95=185.5ms, max=320.5ms
+```
+
+-- and on the paper's own timing-benchmark stress case (Exp 5, P_A), the
+measured retime-only cost actually ROSE, from ~63ms (dense-grid-only
+version above) to ~98ms (this version), since every search now pays the
+closed-form computation's overhead before potentially still needing the
+dense grid too. The dense-grid safety net was kept for exactly this reason
+(it is not a leftover -- it is load-bearing) and is confirmed necessary in
+practice, not just in theory: both cases above where the closed-form set
+missed a feasible lambda were correctly rescued by the real implementation
+(`_search_retime_whole_route`, which includes the safety net), returning
+`lambda=1.219` and `lambda=1.526` respectively.
+
+**What this is worth keeping for, honestly:** the closed-form path is
+provably exact for whatever it directly checks (never a false positive,
+same as the dense grid), is grounded in the actual simulated dynamics
+rather than an idealized frictionless model (a real correctness fix in its
+own right, independent of the speed question), and costs nothing extra
+when `lambda_max` alone already clears `m_safe` (the majority, 63.9%, of
+cases) since it is only invoked after that check fails. It is not,
+however, the "recommended path" speedup `monotonicity_lemma_draft.md`
+projected for a narrower, single-joint or few-step setting -- on this
+benchmark's whole-route candidate counts, it is roughly cost-neutral to
+mildly more expensive than the dense grid it was meant to shortcut. See
+the paper's `predictive_realizability_paper_draft.md` Sec. VI and Draft
+Status item 14, and `monotonicity_lemma_draft.md`'s own status note, for
+where this is disclosed.
+
 ## Real results from the current implementation
 
 - **Exp 1 (no-regression check):** B1/B2/B3 are bit-for-bit identical on a benign

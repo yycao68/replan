@@ -203,6 +203,45 @@ def test_route_level_reshape_restores_feasibility_when_retiming_cannot():
     assert np.allclose(route.traj.qf, qf, atol=1e-3), "reshape must reach the SAME goal"
 
 
+def test_closed_form_retiming_rescues_a_genuinely_dynamic_nonmonotonic_scenario():
+    """Regression test for the gap monotonicity_lemma_draft.md Sec. 5's own last
+    bullet flagged: the existing static-gravity-deficit test (above) has
+    A_i == 0 for every joint (a degenerate hold trajectory), the one case where
+    non-monotonicity is structurally impossible, so it cannot exercise the
+    closed-form/dense-grid rescue path at all. This scenario is genuinely
+    dynamic (found by direct search, not hand-derived): lambda_max alone does
+    NOT clear m_safe, so the naive fast path would incorrectly report retiming
+    exhausted, but the closed-form candidate set (_closed_form_lambda_
+    candidates, the damping-aware quadratic-in-1/lambda model) finds a rescuing
+    interior lambda directly, without needing the dense-grid safety net."""
+    q0 = np.array([0.4795, 0.3582, 1.0574])
+    qf = np.array([-0.8437, 0.0200, -0.2303])
+    arm = Arm.create()
+    arm.set_payload_mass(3.8901)
+    cert = Certificate(arm=arm, m_safe=2.0)
+    cfg = PlannerConfig(lam_max=4.0)
+    planner = LocalPlanner(arm, cert, cfg)
+    traj = JointTrajectory(q0, qf, T=0.6845)
+
+    m_at_max = planner._whole_route_margin(traj.retimed(cfg.lam_max), None)
+    assert m_at_max < cert.m_safe, "scenario should require an interior lambda, not lambda_max"
+
+    A, B, D = planner._torque_decomposition_whole_route(traj, None)
+    candidates = planner._closed_form_lambda_candidates(A, B, D)
+    assert candidates, "expected at least one interior closed-form candidate"
+    assert any(
+        planner._whole_route_margin(traj.retimed(l), None) >= cert.m_safe for l in candidates
+    ), "expected the closed-form candidate set to contain a rescuing lambda"
+
+    lam = planner._search_retime_whole_route(traj, None)
+    assert lam is not None, "expected the closed-form path to rescue this scenario"
+    assert 1.0 < lam < cfg.lam_max
+    m_final = planner._whole_route_margin(traj.retimed(lam), None)
+    assert m_final >= cert.m_safe - 1e-6
+    print(f"OK: closed-form retiming search found lambda={lam:.4f} restoring m_phys={m_final:.3f} "
+          f"on a genuinely dynamic non-monotonic scenario (lambda_max alone gave {m_at_max:.3f})")
+
+
 if __name__ == "__main__":
     test_fast_heavy_route_falls_to_level4_when_only_that_is_allowed()
     test_retiming_restores_whole_route_feasibility_for_dynamic_deficit()

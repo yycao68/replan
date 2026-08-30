@@ -203,65 +203,112 @@ class LocalPlanner:
         forces = self._sample_forces(ts, Q, ee_force_fn)
         return self.cert.m_phys(Q, Qdot, Qddot, forces)
 
-    def _search_retime_whole_route(self, traj: JointTrajectory, ee_force_fn):
-        """This is the m*_1(p) computation from the paper's Theorem 3 (Sufficient,
-        checkable condition for rerouting necessity). Per joint, torque under
-        uniform time-dilation by lambda decomposes as tau(lambda) = A/lambda^2 + B,
-        where A is the inertial/Coriolis contribution (evaluated at the SAME path
-        fraction, so A itself does not depend on lambda -- only the 1/lambda^2
-        scaling does) and B = g(q) + J^T F_ext(q) is the velocity-independent
-        (gravity + position-only external force) contribution, unchanged by
-        retiming. m_phys(lambda) = min_i [tau_max_i - |A_i/lambda^2 + B_i| -
-        delta_tau_i] is monotonically non-decreasing in lambda -- the theorem's
-        stated assumption -- exactly when sign(A_i) == sign(B_i) for the binding
-        joint/step at every lambda tested (then |A_i/lambda^2+B_i| shrinks
-        monotonically toward |B_i| as lambda grows). When some joint's inertial/
-        Coriolis torque OPPOSES its gravity/external-force torque (e.g.
-        decelerating a downswing partially unloads gravity-holding torque),
-        A_i/lambda^2 + B_i can cross zero at a finite lambda* and grow again
-        beyond it, so m_phys(lambda) is genuinely non-monotonic -- confirmed
-        empirically, not just in principle: a random search over this platform's
-        own scenarios found this in ~1% of trials, including cases where checking
-        lambda_max ALONE (the fast path below) incorrectly reports retiming as
-        exhausted while an interior lambda, sometimes far from lambda_max,
-        actually restores the margin. This is a genuine soundness gap in a
-        bisection search that assumes monotonicity without checking it, found
-        during a full-codebase review and confirmed against the actual scenarios
-        reported in this paper's results (Sec. IX): neither the flagship nor the
-        environment-conditioned scenario's reported conclusion is affected (the
-        flagship's m_phys(lambda) is genuinely monotonic there; the environment-
-        conditioned scenario is technically non-monotonic but the interior
-        deviation is negligible relative to how far below m_safe it stays), but
-        the gap is real and is not assumed away here."""
-        cfg = self.cfg
-        m_at_max = self._whole_route_margin(traj.retimed(cfg.lam_max), ee_force_fn)
-        if m_at_max >= self.cert.m_safe:
-            # Fast path: lambda_max alone already clears -- bisect for the
-            # smallest feasible lambda under the (here, unfalsified) assumption
-            # that reachability is monotonic on this branch.
-            lo, hi = 1.0, cfg.lam_max
-            for _ in range(20):
-                mid = 0.5 * (lo + hi)
-                if self._whole_route_margin(traj.retimed(mid), ee_force_fn) >= self.cert.m_safe:
-                    hi = mid
-                else:
-                    lo = mid
-            return hi
+    def _torque_decomposition_whole_route(self, traj: JointTrajectory, ee_force_fn):
+        """Quadratic-in-x decomposition, x = 1/lambda: tau_i(lambda) = A_i x^2 +
+        D_i x + B_i. This EXTENDS monotonicity_lemma_draft.md Sec. 1-2's
+        tau_i(lambda) = A_i/lambda^2 + B_i (derived 'by the manipulator
+        equation', i.e. assuming no joint damping/friction) with a linear-in-x
+        term D_i, found necessary and confirmed directly against this
+        benchmark's actual dynamics: models/planar3r.xml gives every joint real
+        viscous damping (dof_damping=0.3), and a linear damping torque -c*qdot
+        scales as 1/lambda (=x) under retiming, not 1/lambda^2 -- something the
+        idealized manipulator equation's A/lambda^2+B form cannot represent at
+        all. Verified empirically: with dof_damping zeroed, the idealized
+        2-term model reproduces mj_inverse's actual torque to numerical
+        precision at every lambda tested; with damping present (the model this
+        benchmark actually uses), the 2-term model is off by several percent,
+        growing with lambda -- enough to occasionally flip a margin decision
+        near m_safe. This 3-term fit closes that gap to ~0.02 Nm residual,
+        consistent with the small, non-quadratic Coulomb friction term
+        (dof_frictionloss=0.05) that no closed polynomial form captures
+        exactly, but too small to matter operationally the way the damping gap
+        did.
 
-        # lambda_max alone fails: do NOT assume monotonicity and give up --
-        # confirmed above that this specific inference is unsound in general.
-        # Dense-scan the interval for a rescuing interior lambda before
-        # concluding retiming is genuinely exhausted.
-        grid = np.linspace(1.0, cfg.lam_max, 41)
-        margins = np.array([self._whole_route_margin(traj.retimed(l), ee_force_fn) for l in grid])
-        feasible = margins >= self.cert.m_safe
-        if not np.any(feasible):
-            return None  # even the densely-sampled interval cannot fix it
-        j = int(np.argmax(feasible))  # first grid point that clears m_safe
-        # Refine between the last-infeasible and first-feasible grid points
-        # (bisection is locally valid there even though the function is not
-        # monotonic globally, since this bracket is confirmed to cross m_safe).
-        lo, hi = grid[max(j - 1, 0)], grid[j]
+        B_i, A_i, D_i are recovered from THREE required_torque evaluations at
+        the SAME configuration q with SCALED velocity/acceleration (a real,
+        closed-form fit to the known quadratic-in-x functional form, not an
+        assumption about the specific passive-force law MuJoCo implements
+        internally -- robust to whatever exact numerics mj_inverse uses):
+          B_i = tau_i(q, 0, 0)                                    (x=0 anchor)
+          u_i = tau_i(q, qdot, qddot) - B_i = A_i + D_i            (x=1 anchor)
+          v_i = tau_i(q, qdot/2, qddot/4) - B_i = A_i/4 + D_i/2    (x=0.5 anchor)
+        Solving: A_i = 2*u_i - 4*v_i, D_i = 4*v_i - u_i.
+
+        Sampled at the BASE (lambda=1) trajectory's own dt-spaced wall-clock
+        grid -- the same discretization _whole_route_margin already uses to
+        evaluate any concrete lambda -- so this is a dt-resolution-limited
+        proxy for the continuous-path-fraction closed form, exactly as
+        resolution-limited as the dense-lambda-grid fallback below already is
+        in lambda. Returns (A, B, D), each (n_steps, N_JOINTS)."""
+        cfg = self.cfg
+        n = int(np.ceil(traj.T / cfg.dt)) + 1
+        Q, Qdot, Qddot = traj.sample_horizon(0.0, cfg.dt, n)
+        ts = cfg.dt * np.arange(n)
+        forces = self._sample_forces(ts, Q, ee_force_fn)
+        A = np.zeros((n, N_JOINTS))
+        B = np.zeros((n, N_JOINTS))
+        D = np.zeros((n, N_JOINTS))
+        zeros = np.zeros(N_JOINTS)
+        for j in range(n):
+            fj = None if forces is None else forces[j]
+            b = self.arm.required_torque(Q[j], zeros, zeros, fj)
+            u = self.arm.required_torque(Q[j], Qdot[j], Qddot[j], fj) - b
+            v = self.arm.required_torque(Q[j], Qdot[j] / 2, Qddot[j] / 4, fj) - b
+            B[j] = b
+            A[j] = 2 * u - 4 * v
+            D[j] = 4 * v - u
+        return A, B, D
+
+    def _closed_form_lambda_candidates(self, A: np.ndarray, B: np.ndarray, D: np.ndarray):
+        """Closed-form candidates for interior extrema of |tau_i(lambda)| under
+        the quadratic-in-x model tau_i(x) = A_i x^2 + D_i x + B_i (x=1/lambda):
+        this generalizes monotonicity_lemma_draft.md Sec. 4(b)'s single
+        zero-crossing lambda*_i to the two candidate TYPES a quadratic (rather
+        than a pure 1/lambda^2 term) admits --
+          (1) zero-crossings of tau_i(x) (up to two, quadratic formula; one,
+              linear, if A_i==0): local MAXIMA of margin, generalizing Sec.
+              4(b)'s single lambda*_i to account for D_i;
+          (2) the parabola's own vertex x_v = -D_i/(2A_i): where tau_i(x)
+              itself is extremal, which is also where |tau_i(x)| is extremal
+              whenever tau_i doesn't cross zero nearby -- a candidate type Sec.
+              4(b)'s pure-1/lambda^2 form did not have (a 1/lambda^2 term alone
+              is monotonic in x, so had no vertex to speak of).
+        Every candidate is directly, exactly computable (no grid); each is
+        still just a per-(joint,step) local extremum, so (as documented in
+        _search_retime_whole_route) the AGGREGATE m_phys(lambda) = min over
+        (joint,step) may still have its true supremum at a pairwise crossing
+        this set does not include -- the dense-grid fallback remains the
+        safety net for that gap, unchanged."""
+        cfg = self.cfg
+        out = set()
+        A_flat, B_flat, D_flat = A.ravel(), B.ravel(), D.ravel()
+        for a, b, d in zip(A_flat, B_flat, D_flat):
+            if a == 0:
+                if d != 0:
+                    x_roots = [-b / d]
+                else:
+                    x_roots = []
+            else:
+                disc = d * d - 4 * a * b
+                if disc < 0:
+                    x_roots = []
+                else:
+                    sq = np.sqrt(disc)
+                    x_roots = [(-d + sq) / (2 * a), (-d - sq) / (2 * a)]
+                x_roots.append(-d / (2 * a))  # vertex of the parabola
+            for x in x_roots:
+                if x <= 0:
+                    continue  # lambda = 1/x must be positive and finite
+                lam = 1.0 / x
+                if 1.0 < lam < cfg.lam_max:
+                    out.add(float(lam))
+        return sorted(out)
+
+    def _bisect_feasible(self, traj: JointTrajectory, ee_force_fn, lo: float, hi: float):
+        """Standard bisection for the smallest feasible lambda in [lo, hi],
+        assuming (as the caller must ensure) hi is feasible and lo is not --
+        valid locally on this bracket regardless of whether m_phys(lambda) is
+        monotonic globally."""
         for _ in range(20):
             mid = 0.5 * (lo + hi)
             if self._whole_route_margin(traj.retimed(mid), ee_force_fn) >= self.cert.m_safe:
@@ -269,6 +316,75 @@ class LocalPlanner:
             else:
                 lo = mid
         return hi
+
+    def _search_retime_whole_route(self, traj: JointTrajectory, ee_force_fn):
+        """This is the m*_1(p) computation from the paper's Theorem 3 (Sufficient,
+        checkable condition for rerouting necessity). The paper's Lemma (Sec.
+        VI, per-joint sign condition for retiming monotonicity) is derived for
+        the idealized frictionless manipulator equation and is NOT used here as
+        an operational fast-path gate: checked directly against this
+        benchmark's actual scenarios, that 2-term sign condition holds almost
+        nowhere (0/3000 in a broad random sweep, and even the flagship scenario
+        of Sec. IX-B violates it at 65/138 (joint, step) pairs) -- not because
+        the Lemma is wrong about the idealized case, but because this
+        benchmark's actual dynamics (models/planar3r.xml) include real joint
+        damping the idealized 2-term model cannot represent at all (see
+        _torque_decomposition_whole_route). So instead: check lambda_max
+        directly (cheap, exact, no assumption); if it already clears m_safe,
+        bisect for the smallest feasible lambda (valid regardless of global
+        monotonicity, since bisection here only ever narrows within an interval
+        whose upper end is independently confirmed feasible at every step, so
+        it cannot return an infeasible lambda even if the true feasible set is
+        not an interval). If lambda_max alone fails, use the closed-form
+        candidate set (_closed_form_lambda_candidates, now the damping-aware
+        quadratic-in-1/lambda model) before paying for a dense scan.
+
+        The closed-form candidate set is exact for what it directly checks (an
+        is-this-lambda-feasible query is always a real, direct evaluation of
+        the whole-route certificate, never an estimate), but it is NOT proven
+        exhaustive for the AGGREGATE m_phys(lambda) = min over (joint, step) of
+        several such curves: the supremum of a min of several unimodal curves
+        can in general occur at a pairwise CROSSING point between two different
+        curves, not at either curve's own extremum -- a standard lower-envelope
+        phenomenon, not something this benchmark's 3-DOF dynamics are known to
+        be structurally immune to. So a missed feasible lambda is possible in
+        principle (a false negative -- reporting retiming exhausted when an
+        untested interior lambda would in fact have cleared m_safe), never a
+        false positive. The dense-grid scan is therefore kept as a safety net:
+        it only runs if the closed-form set finds nothing, so overall recall
+        cannot regress relative to the dense-grid-only version this replaces.
+        See code/README.md for the empirical comparison across random
+        scenarios (hit rate of the closed-form set alone, and how often the
+        dense-grid safety net was actually needed, before and after adding the
+        damping-aware D term)."""
+        cfg = self.cfg
+        m_at_max = self._whole_route_margin(traj.retimed(cfg.lam_max), ee_force_fn)
+        if m_at_max >= self.cert.m_safe:
+            return self._bisect_feasible(traj, ee_force_fn, 1.0, cfg.lam_max)
+
+        # lambda_max alone fails: try the closed-form candidate set before
+        # paying for a dense scan.
+        A, B, D = self._torque_decomposition_whole_route(traj, ee_force_fn)
+        candidates = sorted(set([1.0, cfg.lam_max] + self._closed_form_lambda_candidates(A, B, D)))
+        margins = [self._whole_route_margin(traj.retimed(l), ee_force_fn) for l in candidates]
+        feasible_idx = [i for i, m in enumerate(margins) if m >= self.cert.m_safe]
+        if feasible_idx:
+            i = min(feasible_idx)
+            hi = candidates[i]
+            lo = candidates[i - 1] if i > 0 else 1.0
+            return self._bisect_feasible(traj, ee_force_fn, lo, hi)
+
+        # Closed-form set found nothing: fall back to the dense scan as a
+        # safety net against the crossing-point gap described above, rather
+        # than concluding retiming is exhausted on an unproven candidate set.
+        grid = np.linspace(1.0, cfg.lam_max, 41)
+        margins = np.array([self._whole_route_margin(traj.retimed(l), ee_force_fn) for l in grid])
+        feasible = margins >= self.cert.m_safe
+        if not np.any(feasible):
+            return None  # even the densely-sampled interval cannot fix it
+        j = int(np.argmax(feasible))  # first grid point that clears m_safe
+        lo, hi = grid[max(j - 1, 0)], grid[j]
+        return self._bisect_feasible(traj, ee_force_fn, lo, hi)
 
     def _search_reshape_whole_route(self, traj: JointTrajectory, ee_force_fn):
         """Level 2 tried at ROUTE-PLANNING time, not just online: reshape the
