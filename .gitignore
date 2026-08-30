@@ -13,3 +13,4 @@ mujoco_sdk/
 # copyrighted papers, not repo content.
 *.pdf
 !predictive_realizability_paper_draft.pdf
+!predictive_realizability_paper_draft_zh.pdf
