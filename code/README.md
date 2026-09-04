@@ -555,6 +555,95 @@ where this is disclosed.
   robot starts moving," which is worth disclosing plainly rather than
   leaving implicit in the per-cycle numbers above.
 
+### Theorem 4/5: the Level-4 terminal safe set, constructed and verified
+
+`experiments/theorem4_terminal_set.py` is the evidence behind the paper's
+Theorem 4, Theorem 5 and Proposition 6 (Sec. VI), which replaced that
+section's previously deferred Theorem 4. Run it directly or via `run_all.py`.
+Everything below is from an actual run with the seeds in the script.
+
+**What was proved.** Two structural facts about `_brake_profile` do the work.
+It is a *time-invariant* state recursion, so the profile generated from the
+successor state is the exact one-step shift of the profile from the current
+state (verified bit-identical, max mismatch `0.000e+00` over 1000 random
+states -- as a deterministic recursion must be, which is precisely why a
+non-zero result would have meant the theorem was about a different object
+than the code). And it reaches rest at a closed-form step
+`r(x) = max_i ceil(|qdot_i| / (a_max*dt))`, after which rest states are fixed
+points (0 mismatches / 3000 states, 0 fixed-point violations / 3000). On this
+platform `r(x) <= N-1` is exactly `||qdot||_inf <= 2.24 rad/s`.
+
+Those two give recursive feasibility of
+
+    X_f = { x : r(x) <= N-1  and  m_phys(brake_profile(x)) >= 0 }
+
+directly: the successor's profile is already-certified except for one
+appended step, and that appended step repeats the terminal hold state, whose
+margin was already checked. **The membership test is not a new computation** --
+`local_planner.online_step` already evaluates `mk = cert.m_phys(Qk, Qdotk,
+Qddotk, forces_k)` on every Level-4 cycle and currently returns it as a
+diagnostic without acting on it. Theorem 4 identifies that discarded scalar
+as exactly the quantity separating a certified fallback from an uncertified
+one.
+
+**Non-vacuity, which was the condition for including the result at all.**
+Fraction of sampled states admitted, at payloads 0/2/5/8/12 kg:
+
+    H   (statically holdable)   100 / 100  / 64.8 / 38.3 / 24.6 %
+    X_f (Theorem 4)             100 /  98.8 / 42.9 / 19.4 /  7.3 %
+
+and **0 invariance violations across 6,708 successor tests**. The sets shrink
+with payload the way the physics requires and are nowhere empty.
+
+**The gap this construction found, which is the substantive result.** X_f
+certifies the braking *reference*. The policy `baselines.policy_b3` actually
+executes once Level 4 engages is not that reference: it commands
+`(q_actual, 0, 0)` every cycle, which under the shared computed-torque
+controller reduces to `tau = tau_hold(q) - Kd*M(q)*qdot`. The certified
+profile decelerates at `qddot_box = 8 rad/s^2`; the executed law decelerates
+at `Kd*|qdot|`, up to `44.8 rad/s^2` at the brakable-velocity bound. So the
+certificate is checking a gentler brake than the architecture performs, and
+X_f is **not** sufficient for the executed policy: simulating the executed law
+from states in X_f, commanded torque saturated in **0 / 36 / 57 / 85 / 94 of
+150 rollouts** at 0/2/5/8/12 kg. This was not known before the theorem was
+attempted; it is the kind of mismatch a proof surfaces and an experiment does
+not, since the suite's only Level-4 engagement happens to be at rest.
+
+Theorem 5 covers the executed law properly, via a Lyapunov argument on
+`V = 0.5*qdot' M(q) qdot`: with the gravity/force term exactly compensated,
+`Vdot <= -2*Kd*V` by skew-symmetry of `Mdot - 2C` plus the (dissipative)
+damping and Coulomb-friction terms. That gives an exponential decay rate, a
+coasting-displacement bound, and a torque bound, hence a sound invariant set
+`X_f^exec`. Verified over 300 discrete MuJoCo rollouts: V monotonically
+non-increasing in **every** rollout, peak `|tau|/tau_max` 0.34-0.89 (no
+saturation), measured decay rate **1.36-1.44x** the guaranteed `2*Kd` (i.e.
+the guarantee is a true lower bound), realized travel 0.33-0.57 of the bound.
+`X_f^exec` is conservative but not vacuous at any payload -- at braking energy
+`V0 = 0.02 J` it admits 100/100/45.7/25.8/13.2 %, and it is empty above 0 kg
+by `V0 = 1.0 J`.
+
+**Two cheaper alternatives were tried and reported rather than quietly
+dropped.** A pointwise version of the executed condition (evaluated only at
+the engagement state, one extra matrix-vector product) closes most of the gap
+but is still unsound -- 0/0/3/3/4 saturating rollouts -- because `tau_hold`
+grows as the arm coasts into a more demanding configuration, which is exactly
+why Theorem 5's supremum over the coasting ball is load-bearing rather than
+slack. And the obvious fix, making the executed policy *track* the certified
+profile (re-derived from the measured state each cycle) so the certified and
+executed objects coincide, helps a lot without closing it: saturations drop
+from 0/36/57/85/94 to **0/0/2/4/15**, but at 12 kg the closed loop diverges
+outright, because the profile's fixed `qddot_box` deceleration is not itself
+achievable at that payload and tracking error compounds. Making the brake
+profile's deceleration a certified, payload-aware quantity instead of a fixed
+kinematic constant is the natural next step and is not done here.
+
+**Cross-check against the suite.** The one Level-4 engagement the experiments
+actually produce (Exp 6 at 8 kg) engages at rest, `||qdot||_inf = 0`, with
+brake-profile certificate `m = 7.90 Nm` and its terminal configuration inside
+H -- so it is in X_f, and trivially in X_f^exec since `V0 = 0`. Realized peak
+`|tau|/tau_max` over the whole rollout is 0.618, no saturation. The one
+fallback this codebase reports is a certified one.
+
 ## Known simplifications (stated once, applies throughout)
 
 Reduced-order 3-DOF planar arm, not a full FR3 model. Level-1/3 decided once at
@@ -562,9 +651,7 @@ planning time rather than continuously re-optimized (see `local_planner.py`
 docstring). `delta_tau` (Theorem 1's uncertainty bound) is a fixed 5% of
 `tau_max`, not estimated online. No collision/obstacle feasibility set is
 modeled (`F_obs` from the paper's Sec. III is out of scope here; only `F_dyn` is
-tested). Theorem 4 (recursive feasibility) is not attempted, consistent with the
-paper draft's own "deferred" framing. Level 4 (brake) is sticky and terminal:
-once engaged, `baselines.policy_b3` holds the robot at its stopped position for
+tested). Level 4 (brake) is sticky and terminal: once engaged, `baselines.policy_b3` holds the robot at its stopped position for
 the rest of the rollout with no automatic resume (see "What this is" above) --
 this is a genuine, deliberate architectural limitation, not an oversight, but it
 means every result reported here where B3 reaches Level 4 is reporting a safety
