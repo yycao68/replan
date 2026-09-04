@@ -7,6 +7,7 @@ from experiments import (
     exp1_baseline, exp2_payload_sweep, exp3_interaction_force,
     exp4_contact_stiffness_step, exp5_flagship_reroute, exp6_severity_sweep,
     exp7_environment_conditioned_reroute, ablation_batch, timing_benchmark,
+    theorem4_terminal_set,
 )
 
 SECTIONS = [
@@ -20,6 +21,7 @@ SECTIONS = [
     ("Experiment 7: environment-conditioned reroute", exp7_environment_conditioned_reroute.run),
     ("Ablation batch A1-A5", ablation_batch.run),
     ("Real-time timing benchmark (Sec. VIII-J)", timing_benchmark.run),
+    ("Theorem 4/5: terminal safe set and recursive feasibility (Sec. VI)", theorem4_terminal_set.run),
 ]
 
 if __name__ == "__main__":

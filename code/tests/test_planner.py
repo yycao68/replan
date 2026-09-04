@@ -242,6 +242,102 @@ def test_closed_form_retiming_rescues_a_genuinely_dynamic_nonmonotonic_scenario(
           f"on a genuinely dynamic non-monotonic scenario (lambda_max alone gave {m_at_max:.3f})")
 
 
+# ---------------------------------------------------------------------------
+# Theorem 4 / the Lemma on the brake recursion (paper Sec. VI). These are
+# correctness checks on the two structural properties the proof rests on, plus
+# a small-sample check of the invariance conclusion itself. The full sweep
+# behind the paper's reported numbers lives in
+# experiments/theorem4_terminal_set.py; these keep the properties in the test
+# suite so a future change to _brake_profile cannot silently invalidate the
+# theorem without a test failing.
+# ---------------------------------------------------------------------------
+
+def _brake_planner(payload_kg=0.0):
+    arm = Arm.create()
+    arm.set_payload_mass(payload_kg)
+    cert = Certificate(arm=arm)
+    cfg = PlannerConfig()
+    return arm, cert, cfg, LocalPlanner(arm, cert, cfg)
+
+
+def test_brake_recursion_is_time_invariant_shift():
+    """Lemma (i): B(f(x))_j == B(x)_{j+1}. This is what makes Theorem 4's
+    successor profile already-certified except for its one appended step."""
+    _, _, cfg, planner = _brake_planner()
+    rng = np.random.default_rng(0)
+    n = cfg.horizon_steps
+    worst = 0.0
+    for _ in range(50):
+        q = rng.uniform(-np.pi, np.pi, 3)
+        qdot = rng.uniform(-3.0, 3.0, 3)
+        Q, Qdot, Qddot = planner._brake_profile(q, qdot)
+        Q2, Qdot2, Qddot2 = planner._brake_profile(Q[1], Qdot[1])
+        worst = max(
+            worst,
+            float(np.abs(Q2[: n - 1] - Q[1:]).max()),
+            float(np.abs(Qdot2[: n - 1] - Qdot[1:]).max()),
+            float(np.abs(Qddot2[: n - 1] - Qddot[1:]).max()),
+        )
+    assert worst == 0.0, f"brake recursion is not shift-invariant (max mismatch {worst:g})"
+    print("OK: brake profile from the successor state is the exact one-step shift "
+          "(Lemma (i), bit-identical over 50 states)")
+
+
+def test_brake_reaches_rest_at_predicted_step_and_holds():
+    """Lemma (ii)/(iii): rest at r(x) = max_i ceil(|qdot_i|/(a_max dt)), and rest
+    states are fixed points. r(x) <= N-1 is Theorem 4's completion condition."""
+    _, _, cfg, planner = _brake_planner()
+    n, dt, amax = cfg.horizon_steps, cfg.dt, cfg.qddot_box
+    v_brake = (n - 1) * amax * dt
+    rng = np.random.default_rng(1)
+    for _ in range(100):
+        q = rng.uniform(-np.pi, np.pi, 3)
+        qdot = rng.uniform(-v_brake, v_brake, 3)
+        r = int(np.max(np.ceil(np.abs(qdot) / (amax * dt) - 1e-12)))
+        assert r <= n - 1
+        Q, Qdot, Qddot = planner._brake_profile(q, qdot)
+        assert np.allclose(Qdot[r], 0.0), "did not reach rest at the predicted step"
+        assert r == 0 or not np.allclose(Qdot[r - 1], 0.0), "reached rest early"
+        assert np.allclose(Q[r:], Q[r]), "configuration moved after reaching rest"
+        assert np.allclose(Qdot[r:], 0.0) and np.allclose(Qddot[r:], 0.0)
+    print(f"OK: brake reaches rest at r(x) and holds there (Lemma (ii)/(iii)); "
+          f"r(x) <= N-1 iff ||qdot||_inf <= {v_brake:.2f} rad/s")
+
+
+def test_terminal_safe_set_is_positively_invariant():
+    """Theorem 4(i): x in X_f => f(x) in X_f, where membership is 'reaches rest
+    within the horizon AND the certificate over the whole brake profile is
+    non-negative'. Also checks the set is non-vacuous at a nontrivial payload."""
+    n_members = 0
+    for payload in (0.0, 5.0):
+        arm, cert, cfg, planner = _brake_planner(payload)
+        n, dt, amax = cfg.horizon_steps, cfg.dt, cfg.qddot_box
+        v_brake = (n - 1) * amax * dt
+        rng = np.random.default_rng(2)
+
+        def member(q, qdot):
+            if np.max(np.abs(qdot)) > v_brake + 1e-12:
+                return False
+            Q, Qdot, Qddot = planner._brake_profile(q, qdot)
+            return cert.m_phys(Q, Qdot, Qddot, None) >= 0.0
+
+        members = 0
+        for _ in range(120):
+            q = rng.uniform(-np.pi, np.pi, 3)
+            qdot = rng.uniform(-v_brake, v_brake, 3)
+            if not member(q, qdot):
+                continue
+            members += 1
+            Q, Qdot, _ = planner._brake_profile(q, qdot)
+            assert member(Q[1], Qdot[1]), (
+                f"invariance violated at payload {payload} kg: q={q}, qdot={qdot}"
+            )
+        assert members > 0, f"X_f sampled empty at payload {payload} kg -- test is vacuous"
+        n_members += members
+    print(f"OK: X_f is positively invariant under the brake recursion "
+          f"(Theorem 4(i)); 0 violations over {n_members} sampled members")
+
+
 if __name__ == "__main__":
     test_fast_heavy_route_falls_to_level4_when_only_that_is_allowed()
     test_retiming_restores_whole_route_feasibility_for_dynamic_deficit()
@@ -252,4 +348,8 @@ if __name__ == "__main__":
     test_policy_b3_sticky_brake_holds_position_after_level4()
     test_reroute_switches_to_alt_route_when_primary_infeasible()
     test_route_level_reshape_restores_feasibility_when_retiming_cannot()
+    test_closed_form_retiming_rescues_a_genuinely_dynamic_nonmonotonic_scenario()
+    test_brake_recursion_is_time_invariant_shift()
+    test_brake_reaches_rest_at_predicted_step_and_holds()
+    test_terminal_safe_set_is_positively_invariant()
     print("\nAll planner tests passed.")
