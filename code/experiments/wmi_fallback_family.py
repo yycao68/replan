@@ -1,7 +1,7 @@
-"""P2: does a FALLBACK FAMILY work, and can the right member be selected?
+"""wm_interface: does a FALLBACK FAMILY work, and can the right member be selected?
 
 BELONGS TO THE SECOND PAPER (`../../world_model_realizability_core.md`), like
-`p2_theorem3_hypothesis_fallback.py`, and is likewise not wired into run_all.py.
+`wmi_theorem3_hypothesis_fallback.py`, and is likewise not wired into run_all.py.
 
 WHY THIS EXISTS. The T3 experiment found that a stop-in-place fallback has
 almost no authority against a quasi-static environment surprise: braking removes
@@ -19,7 +19,7 @@ steps, each of which can refute it:
 
   F. Does the family buy coverage? Sizes of X_brake, X_retreat and their union
      under the hypothesis-free bound E_wc -- and, separately, whether each
-     member set is positively invariant under its own policy. P1's Theorem 4
+     member set is positively invariant under its own policy. realiz_main's Theorem 4
      proved invariance for the brake by a shift argument that turns on the brake
      recursion being TIME-INVARIANT. Retreat (brake, then accelerate away) is
      not obviously time-invariant, so that proof does not transfer for free and
@@ -33,6 +33,14 @@ steps, each of which can refute it:
      different regressor direction, so the class that explains the residual
      better is the one to index by.
 
+EPS_R CAVEAT, shared with the T3 module. Margins here subtract `cert.delta_tau`,
+which is realiz_main's bound and covers "model mismatch AND contact/disturbance prediction
+error" (realiz_main Sec. IV). wm_interface's eps_R is the ROBOT-model error alone -- environment
+uncertainty lives in the hypothesis set, not in eps_R -- so using delta_tau as
+eps_R double-counts. Everything here is therefore more conservative than wm_interface
+Def. 2 requires; nothing is unsafe. Part G sweeps the scale so the cost is
+measured rather than asserted.
+
 FALSIFICATION CLASSES. Both are exactly affine in a scalar environment
 parameter, so per-joint worst cases over an interval are attained at endpoints
 and are computed exactly rather than sampled (as in the T3 module):
@@ -41,7 +49,7 @@ and are computed exactly rather than sampled (as in the T3 module):
   - PAYLOAD (inertial): end-effector mass m; torque is affine in m, verified to
     ~1e-4 N*m by three-point extrapolation in `_self_check`.
 
-Run: python3 experiments/p2_fallback_family.py
+Run: python3 experiments/wmi_fallback_family.py
 """
 import sys, os
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -108,7 +116,7 @@ def margins_payload(arm, cert, Q, Qd, Qdd, m_rng):
 # the two fallbacks
 # ----------------------------------------------------------------------
 def brake_profile(planner, q, qd, steps=None):
-    """P1's Level-4 brake, optionally extended: rest states are fixed points of the
+    """realiz_main's Level-4 brake, optionally extended: rest states are fixed points of the
     recursion, so extending past r(x) only appends hold steps."""
     Q, Qd, Qdd = planner._brake_profile(q, qd)
     if steps is None or steps <= N:
@@ -283,7 +291,7 @@ def part_e(n=250):
 
 def part_f(n=400):
     """Coverage of the family under the hypothesis-free bound, and whether each
-    member set is invariant under its own policy -- which P1's Theorem 4 proved
+    member set is invariant under its own policy -- which realiz_main's Theorem 4 proved
     for the brake via a shift argument that does NOT obviously transfer."""
     print("\nF. Family coverage under E_wc, and invariance of each member set")
     arm, cert, pl = _make()
@@ -319,7 +327,7 @@ def part_f(n=400):
             if not feasible(P[0][1], P[1][1], fb):
                 viol += 1
         print(f"   {fb:>10} {members:8d} {viol:14d} / {members}")
-    print("   The brake's 0 violations reproduce P1 Theorem 4 under a worst-case environment")
+    print("   The brake's 0 violations reproduce realiz_main Theorem 4 under a worst-case environment")
     print("   set rather than a nominal one, which is worth having on its own.")
     print("   The coverage result is negative and is the point of this part: under the full")
     print("   E_wc the two sets are not merely the same SIZE, they are the same STATES")
@@ -395,6 +403,7 @@ def part_g(n=300):
         mg = np.array(margins)
         print(f"   separation (wrong-model fit error / right-model fit error): "
               f"median {np.median(mg):.1f}x, 10th pct {np.percentile(mg,10):.1f}x")
+    _part_g_eps_sweep(arm, cert, pl, states)
     print("   Residuals carry eps_R = delta_tau of injected robot-model error, so this")
     print("   measures identification under the same uncertainty the certificate budgets")
     print("   for, not against a noiseless residual built from one of the two models.")
@@ -402,8 +411,59 @@ def part_g(n=300):
     print("   state and the family cannot be indexed there, whatever the accuracy.")
 
 
+def _part_g_eps_sweep(arm, cert, pl, states, scales=(1.0, 0.5, 0.25, 0.1)):
+    """How much of part G's error rate is the eps_R over-count (see header)?
+    The 1.0 row is what part G reports; the smaller rows approach wm_interface Def. 2's
+    own eps_R, in which the environment's share of the uncertainty sits in the
+    hypothesis set instead of in the residual noise."""
+    print(f"\n   eps_R sensitivity on identification accuracy:")
+    print(f"   {'eps_R':>12} {'accuracy':>10} {'median separation':>19}")
+    for esc in scales:
+        rng = np.random.default_rng(5)
+        ok = tot = 0
+        mg = []
+        for q, qd in states:
+            qdd = rng.uniform(-AMAX, AMAX, N_JOINTS)
+            arm.set_payload_mass(M_ASSERTED)
+            s_nom = contact_s(arm, q, Z_ASSERTED, K_ASSERTED)
+            tau_nom = tau_contact(arm, q, qd, qdd, s_nom)
+            v_c = -arm.jacobian(q)[1, :]
+            arm.set_payload_mass(M_ASSERTED)
+            t0 = arm.required_torque(q, qd, qdd, np.array([0.0, s_nom]))
+            arm.set_payload_mass(M_ASSERTED + 1.0)
+            v_p = arm.required_torque(q, qd, qdd, np.array([0.0, s_nom])) - t0
+            arm.set_payload_mass(M_ASSERTED)
+            for truth in ("contact", "payload"):
+                if truth == "contact":
+                    z = Z_ASSERTED + rng.uniform(0.05, 0.15)
+                    arm.set_payload_mass(M_ASSERTED)
+                    r = tau_contact(arm, q, qd, qdd, contact_s(arm, q, z, K_ASSERTED)) - tau_nom
+                else:
+                    arm.set_payload_mass(M_ASSERTED + rng.uniform(3.0, 7.0))
+                    r = arm.required_torque(q, qd, qdd, np.array([0.0, s_nom])) - tau_nom
+                    arm.set_payload_mass(M_ASSERTED)
+                r = r + rng.uniform(-1.0, 1.0, N_JOINTS) * (esc * cert.delta_tau)
+                if np.linalg.norm(r) < 1e-9:
+                    continue
+                fit = {}
+                for name, v in (("contact", v_c), ("payload", v_p)):
+                    nv = float(v @ v)
+                    th = (r @ v) / nv if nv > 1e-12 else 0.0
+                    fit[name] = float(np.linalg.norm(r - th * v))
+                tot += 1
+                ok += int(min(fit, key=fit.get) == truth)
+                mg.append(fit["payload" if truth == "contact" else "contact"]
+                          / max(fit[truth], 1e-12))
+        print(f"   {f'{esc:.2f} x dtau':>12} {100*ok/max(tot,1):9.1f}% "
+              f"{np.median(mg) if mg else float('nan'):18.1f}x")
+    print("   The 1.00 row is an independent redraw of the headline above and should agree")
+    print("   with it to sampling noise (70.0% vs 72.3%), not exactly. Accuracy rising as")
+    print("   eps_R shrinks shows that headline is a floor set partly by realiz_main's bundled")
+    print("   bound, not purely by the two classes being alike.")
+
+
 def run():
-    print("P2 -- fallback family: authority, coverage, and whether it can be indexed")
+    print("wm_interface -- fallback family: authority, coverage, and whether it can be indexed")
     _self_check()
     part_e()
     part_f()

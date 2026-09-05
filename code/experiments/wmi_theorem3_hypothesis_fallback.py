@@ -1,14 +1,14 @@
-"""P2 Theorem 3: does the safety fallback survive the world model being wrong?
+"""wm_interface Theorem 3: does the safety fallback survive the world model being wrong?
 
 BELONGS TO THE SECOND PAPER (`../../world_model_realizability_core.md`), not to
 the predictive-realizability draft this directory otherwise verifies. It is
 deliberately NOT wired into `run_all.py`, so that `run_all.py` keeps reproducing
-exactly the numbers P1's Sec. IX cites and nothing else. It reuses P1's platform
+exactly the numbers realiz_main's Sec. IX cites and nothing else. It reuses realiz_main's platform
 (planar3r, the Sec. IV certificate, and the Level-4 brake recursion whose
 terminal-set machinery is in `theorem4_terminal_set.py`) because the physics
 question is the same one at a different level of the architecture.
 
-THE CLAIM UNDER TEST (P2, Theorem 3). A terminal safe set computed under the
+THE CLAIM UNDER TEST (wm_interface, Theorem 3). A terminal safe set computed under the
 world model's own environment hypothesis H_E gives no guarantee once H_E is
 false, because the falsification event that invalidates the plan can invalidate
 the fallback at the same instant. A terminal set computed under a
@@ -25,14 +25,14 @@ WHAT WOULD MAKE THIS EXPERIMENT WORTHLESS, and how each is avoided:
       PAST the edge of E_wc so that the wc construction is seen to fail too.
       A guarantee that never fails anywhere is a guarantee that was assumed.
 
-  (b) Confounding with P1's own reference-vs-executed gap. P1's Proposition 6
+  (b) Confounding with realiz_main's own reference-vs-executed gap. realiz_main's Proposition 6
       already established that the executed sticky-hold law saturates from
-      states P1's Theorem 4 admits, with no falsification involved at all
+      states realiz_main's Theorem 4 admits, with no falsification involved at all
       (0/36/57/85/94 of 150 rollouts at 0/2/5/8/12 kg). Mixing that in would
       make falsification look responsible for failures it did not cause. This
       module therefore measures at the REFERENCE level throughout -- the object
-      P2's Theorem 3 is stated about -- and the executed-level gap is left where
-      P1 measured it.
+      wm_interface's Theorem 3 is stated about -- and the executed-level gap is left where
+      realiz_main measured it.
 
   (c) A hand-picked scenario. Part A samples states rather than choosing them,
       Part B sweeps the falsification magnitude rather than fixing it, and the
@@ -40,14 +40,14 @@ WHAT WOULD MAKE THIS EXPERIMENT WORTHLESS, and how each is avoided:
       reader can see it was tuned to be certified-then-violated, which is the
       point rather than a concealment.
 
-ENVIRONMENT MODEL. P1's Exp 4/7 contact plane: a virtual surface at world height
+ENVIRONMENT MODEL. realiz_main's Exp 4/7 contact plane: a virtual surface at world height
 z, exerting an upward penetration-proportional force K*max(0, z - ee_z) on the
 end-effector. An environment realization is the pair (z, K); an environment SET
 is a box over both. This is the smallest model that supports a falsifiable
 hypothesis: the world model asserts where the floor is and how stiff it is, and
 reality can put it somewhere else.
 
-Run: python3 experiments/p2_theorem3_hypothesis_fallback.py
+Run: python3 experiments/wmi_theorem3_hypothesis_fallback.py
 """
 import sys, os
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -63,7 +63,7 @@ from local_planner import LocalPlanner, PlannerConfig
 
 CFG = PlannerConfig()
 N, DT, AMAX = CFG.horizon_steps, CFG.dt, CFG.qddot_box
-V_BRAKE = (N - 1) * AMAX * DT      # brake-completion bound, P1 Theorem 4's Lemma (ii)
+V_BRAKE = (N - 1) * AMAX * DT      # brake-completion bound, realiz_main Theorem 4's Lemma (ii)
 M_SAFE = 2.0
 
 # --- the hypothesis the world model asserts, and the physical bound -------
@@ -77,7 +77,7 @@ class EnvBox:
     """A set of contact-plane realizations {(z, K) : z in [z_lo,z_hi], K in [k_lo,k_hi]}.
 
     A singleton (lo == hi) is an admissible degenerate case and is what a
-    point-predicting world model emits -- P2 Def. 1's remark."""
+    point-predicting world model emits -- wm_interface Def. 1's remark."""
     z_lo: float
     z_hi: float
     k_lo: float
@@ -110,9 +110,25 @@ def _envs(z_band=0.01, k_frac=0.10, wc_z=(0.45, 0.70), wc_k=(0.0, 900.0)):
 # interval [s_lo, s_hi] attained at the box's corners, and |tau_i(s)| -- a
 # modulus of an affine function -- attains its supremum on that interval at an
 # endpoint. Two inverse-dynamics evaluations therefore give the EXACT per-joint
-# supremum, so this implementation realizes P2 Theorem 1(ii)'s tightness rather
-# than approximating it: the worst case reported is achieved by an environment
-# genuinely admissible under the box.
+# supremum over the box: the worst case reported is achieved by an environment
+# genuinely admissible under it, with no sampling error.
+#
+# THAT IS NOT THE SAME AS wm_interface Theorem 1(ii)'s tightness, and an earlier version of
+# this comment claimed it was. Theorem 1(ii) says the margin test is exact
+# relative to (H_E, eps_R), with eps_R the ROBOT-model error alone -- wm_interface carries
+# environment uncertainty in the set H_E, not in eps_R. This code subtracts
+# `cert.delta_tau`, which is realiz_main's bound and covers "model mismatch AND
+# contact/disturbance prediction error" (realiz_main Sec. IV). Using it as eps_R
+# therefore DOUBLE-COUNTS environment-prediction error that the sup over the box
+# already accounts for, so the margin here is strictly more conservative than
+# wm_interface Def. 2 requires: the test is sound but not tight.
+#
+# The conflation is kept for continuity with realiz_main's numbers rather than silently
+# corrected, because realiz_main never decomposed delta_tau into a robot part and an
+# environment part, so any split would be invented here. Its consequences are
+# one-directional (everything is more conservative, nothing is unsafe) and are
+# measured rather than argued: part C2 sweeps eps_R and reports how far the
+# rho > beta threshold moves.
 # ----------------------------------------------------------------------
 def force_scalar_range(arm, q, box: EnvBox):
     ee_z = arm.ee_position(q)[1]
@@ -124,18 +140,24 @@ def force_scalar(arm, q, z, k):
     return k * max(0.0, z - arm.ee_position(q)[1])
 
 
-def beta_at(arm, cert, q, box: EnvBox, z_nom, k_nom):
-    """P2 Def. 5's detection threshold at one state: the largest torque discrepancy
+def eps_R(cert, scale=1.0):
+    """wm_interface's robot-model error bound. Defaults to realiz_main's delta_tau; see the header
+    comment for why that over-counts, and part C2 for how much it costs."""
+    return scale * cert.delta_tau
+
+
+def beta_at(arm, cert, q, box: EnvBox, z_nom, k_nom, eps_scale=1.0):
+    """wm_interface Def. 5's detection threshold at one state: the largest torque discrepancy
     the hypothesis itself can explain, plus the robot-model error bound. A residual
     above this cannot be accounted for by any environment the hypothesis admits."""
     s_lo, s_hi = force_scalar_range(arm, q, box)
     s_nom = force_scalar(arm, q, z_nom, k_nom)
     jz = np.abs(arm.jacobian(q)[1, :])
     swing = max(abs(s_hi - s_nom), abs(s_nom - s_lo))
-    return float(np.max(jz * swing) + np.max(cert.delta_tau))
+    return float(np.max(jz * swing) + np.max(eps_R(cert, eps_scale)))
 
 
-def worst_case_margins(arm, cert, Q, Qdot, Qddot, box: EnvBox):
+def worst_case_margins(arm, cert, Q, Qdot, Qddot, box: EnvBox, eps_scale=1.0):
     """(n_steps, n_joints) array of tau_max - sup_{e in box}|tau_req,i| - delta_tau."""
     n_steps = Q.shape[0]
     m = np.zeros((n_steps, N_JOINTS))
@@ -144,13 +166,13 @@ def worst_case_margins(arm, cert, Q, Qdot, Qddot, box: EnvBox):
         jz = arm.jacobian(Q[j])[1, :]
         s_lo, s_hi = force_scalar_range(arm, Q[j], box)
         worst = np.maximum(np.abs(tau_id - jz * s_lo), np.abs(tau_id - jz * s_hi))
-        m[j, :] = TAU_MAX - worst - cert.delta_tau
+        m[j, :] = TAU_MAX - worst - eps_R(cert, eps_scale)
     return m
 
 
-def rho(arm, cert, Q, Qdot, Qddot, box: EnvBox):
-    """P2 Def. 2: the realizability margin of a trajectory under an environment set."""
-    return float(worst_case_margins(arm, cert, Q, Qdot, Qddot, box).min())
+def rho(arm, cert, Q, Qdot, Qddot, box: EnvBox, eps_scale=1.0):
+    """wm_interface Def. 2: the realizability margin of a trajectory under an environment set."""
+    return float(worst_case_margins(arm, cert, Q, Qdot, Qddot, box, eps_scale).min())
 
 
 def _r_of(qdot):
@@ -158,7 +180,7 @@ def _r_of(qdot):
 
 
 def in_terminal_set(planner, arm, cert, q, qdot, box: EnvBox):
-    """Membership in X_f^box: the brake reaches rest inside the horizon (P1
+    """Membership in X_f^box: the brake reaches rest inside the horizon (realiz_main
     Theorem 4's completion condition) and the whole brake profile, including its
     terminal hold, is actuator-feasible for EVERY environment in the box."""
     if _r_of(qdot) > N - 1:
@@ -312,7 +334,7 @@ def part_c1(payload=1.0, via_q1=0.46, dz=0.07):
 
 def part_c2(payload=1.0, via_q1=0.46, dz=0.07,
             bands=(0.100, 0.050, 0.020, 0.010, 0.005, 0.002)):
-    """P2 Theorems 1(iii) and 2 together: tightening the hypothesis returns margin
+    """wm_interface Theorems 1(iii) and 2 together: tightening the hypothesis returns margin
     and lowers the detection threshold, and warning time becomes GUARANTEED once
     rho > beta. A single hypothesis width would show neither."""
     print("\nC2. Hypothesis width vs warning time (Theorem 1(iii) + Theorem 2)")
@@ -355,7 +377,37 @@ def part_c2(payload=1.0, via_q1=0.46, dz=0.07,
         print(f"   {band:8.3f} {b_at_det:7.2f} {r:7.2f} {str(r > b_at_det):>9} "
               f"{td:7.3f} {tw:9.3f} {pred:15.3f}")
         out[band] = (b_at_det, r, td, tw, pred)
-    print("   rho is the H_E margin banked over the plan from onset onward.")
+    print("\n   eps_R sensitivity: this module uses realiz_main's delta_tau as eps_R, which also")
+    print("   carries environment-prediction error the sup over H_E already covers (see the")
+    print("   header comment). Sweeping the scale shows how much of the tight-hypothesis")
+    print("   requirement above is that over-count rather than physics:")
+    print(f"   {'eps_R':>12} {'z band for rho>beta':>21} {'beta':>7} {'rho':>7} {'pred T_w':>9}")
+    for esc in (1.0, 0.5, 0.25, 0.0):
+        crossed = None
+        for band in (0.100, 0.050, 0.020, 0.010, 0.005, 0.002):
+            h = EnvBox(Z_ASSERTED - band, Z_ASSERTED + band,
+                       K_ASSERTED * 0.9, K_ASSERTED * 1.1, "H_E")
+            bt = np.array([beta_at(arm, cert, Q[j], h, Z_ASSERTED, K_ASSERTED, esc)
+                           for j in range(len(ts))])
+            r = rho(arm, cert, Q[i0:], Qd[i0:], Qdd[i0:], h, esc)
+            fired = np.flatnonzero(dev > bt)
+            fired = fired[fired >= i0]
+            b = float(bt[fired[0]]) if fired.size else float(bt[i0])
+            if r > b:
+                crossed = (band, b, r, (r - b) / L)
+                break
+        lbl = f"{esc:.2f} x dtau"
+        if crossed:
+            band, b, r, pw = crossed
+            print(f"   {lbl:>12} {band:21.3f} {b:7.2f} {r:7.2f} {pw:9.3f}")
+        else:
+            print(f"   {lbl:>12} {'none in sweep':>21} {'':>7} {'':>7} {'':>9}")
+    print("   The 0.00 row is the limit in which eps_R is dropped entirely and H_E alone")
+    print("   carries the uncertainty, i.e. wm_interface Def. 2 read literally. The gap between it")
+    print("   and the 1.00 row is the cost of realiz_main's bundled bound, and it is the honest")
+    print("   caveat on the tight-hypothesis conclusion above.")
+
+    print("\n   rho is the H_E margin banked over the plan from onset onward.")
     print("   Read the last two columns together: the prediction is a GUARANTEED LOWER")
     print("   BOUND, so pred <= meas is the theorem holding, and a negative pred means")
     print("   no guarantee is available at that hypothesis width -- not a refutation.")
@@ -363,7 +415,7 @@ def part_c2(payload=1.0, via_q1=0.46, dz=0.07,
 
 
 def part_c3(payload=1.0, dz=0.07, vias=np.arange(0.20, 0.52, 0.02)):
-    """P2 Theorem 3 proper. Condition (b) says the planner must MAINTAIN
+    """wm_interface Theorem 3 proper. Condition (b) says the planner must MAINTAIN
     x in X_f^wc along the plan. The previous version of this experiment did not
     enforce it, so the wc set merely refused the state and demonstrated nothing.
     Here two planners are compared: one enforcing only the H_E certificate, one
@@ -432,7 +484,7 @@ def part_d(payload=1.0, dzs=(0.05, 0.10, 0.15)):
     """How much authority does a stop-in-place fallback actually have against this
     falsification class? Theorem 3 guarantees the fallback is FEASIBLE; it says
     nothing about whether stopping helps. For a position-dependent contact force
-    the deficit is quasi-static -- P1's Exp 7 makes the same point about retiming --
+    the deficit is quasi-static -- realiz_main's Exp 7 makes the same point about retiming --
     so braking can only prevent the robot going DEEPER, not relieve the force
     already acting. That distinction decides whether Theorem 3 buys anything real,
     and it is measurable rather than arguable."""
@@ -468,7 +520,7 @@ def part_d(payload=1.0, dzs=(0.05, 0.10, 0.15)):
 
 
 def run():
-    print("P2 Theorem 3 -- hypothesis-free recovery on P1's contact-plane platform")
+    print("wm_interface Theorem 3 -- hypothesis-free recovery on realiz_main's contact-plane platform")
     _self_check()
     part_a()
     part_b()
