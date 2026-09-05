@@ -4,9 +4,26 @@ __pycache__/
 code/results/
 MUJOCO_LOG.TXT
 
-# FR3/MoveIt2/ROS2 workspace and staged MuJoCo SDK (Phase 0/1 infra work) --
-# large build artifacts and cloned third-party sources, not paper content.
-ros2_ws/
+# FR3/MoveIt2/ROS2 workspace: ros2_ws/src is now tracked here (merged in from
+# the former standalone fr3-hybrid-planning repo, full history preserved via
+# git subtree). Only the colcon build/runtime artifacts stay ignored.
+ros2_ws/build/
+ros2_ws/install/
+ros2_ws/log/
+ros2_ws/.cache/
+
+# Third-party clones with their own independent git history/remote, vendored
+# under ros2_ws/src -- not tracked here (each is its own repo).
+ros2_ws/src/franka_description/
+ros2_ws/src/moveit_hybrid_planning/
+ros2_ws/src/mujoco_menagerie_sparse/
+ros2_ws/src/mujoco_ros2_control/
+
+# Vendored MuJoCo Menagerie FR3 asset dump (meshes/textures/LICENSE/README
+# copied in verbatim, not authored here) -- large binary third-party content.
+ros2_ws/src/fr3_mujoco_bringup/mujoco_models/
+
+# Staged MuJoCo SDK (Phase 0/1 infra work) -- large build artifacts.
 mujoco_sdk/
 
 # Downloaded reference PDFs for citation verification -- third-party
