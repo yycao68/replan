@@ -518,11 +518,14 @@ where this is disclosed.
   variables/step, plus `2*(horizon_steps-1)` integration-equality
   constraints) -- a materially larger problem for OSQP to solve from scratch
   each call. Measured directly on this same stress scenario: the one-shot
-  solve's cost roughly doubled, mean ~3.0-3.1ms, p95 ~49ms, **max ~52-54ms**
+  solve's cost roughly doubled, mean ~2.4-2.5ms, p95 ~40-41ms, **max ~42-45ms**
   (was ~18-20ms before the fix). (A figure of p95 ~27ms was reported here
-  previously; two independent fresh reruns during a later review both gave
-  p95 ~48.7-49.5ms instead, closely bracketing the max rather than sitting
-  far below it -- corrected to match, since the paper's own standard is a
+  previously, then corrected to p95 ~48.7-49.5ms/max ~52-54ms during a later
+  review; a further re-audit (7 fresh reruns across two verification sessions
+  on this machine) found that figure had itself drifted with ordinary
+  machine/environment variation, not a logic change in the measured code
+  path -- corrected again to the range above, still closely bracketing the
+  max rather than sitting far below it, since the paper's own standard is a
   fresh rerun before any number is trusted.) This is the honest price of the QP now
   certifying a trajectory it can actually produce instead of a cheaper one
   that mixed the nominal route's positions with different accelerations (see

@@ -364,7 +364,7 @@ if __name__ == "__main__":
     test_brake_profile_starts_from_q_actual_not_nominal_sample()
     test_policy_b3_sticky_brake_holds_position_after_level4()
     test_reroute_switches_to_alt_route_when_primary_infeasible()
-    test_route_level_reshape_restores_feasibility_when_retiming_cannot()
+    test_route_level_reshape_does_not_falsely_pass_a_position_dependent_force_field()
     test_closed_form_retiming_rescues_a_genuinely_dynamic_nonmonotonic_scenario()
     test_brake_recursion_is_time_invariant_shift()
     test_brake_reaches_rest_at_predicted_step_and_holds()
