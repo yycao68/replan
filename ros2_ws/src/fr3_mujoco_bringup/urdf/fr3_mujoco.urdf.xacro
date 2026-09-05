@@ -1,0 +1,113 @@
+<?xml version="1.0" ?>
+<!--
+  Phase 1 bringup xacro: wraps franka_description's driver-free FR3 arm
+  (arm only, no gripper, out of scope for this phase) with a hand-written
+  ros2_control block targeting mujoco_ros2_control/MujocoSystem.
+
+  franka_description deliberately ships no ros2_control coupling (that logic
+  lives in franka_hardware, which requires libfranka and is Linux-only), so
+  this block is authored here instead of reusing franka_hardware's
+  franka_arm.ros2_control.xacro. Joint names (fr3_joint1..7) come from
+  franka_description/robots/fr3/joint_limits.yaml.
+
+  Command interface is effort, not position: mujoco_ros2_control's
+  MujocoSystem::write() (read directly from source this session) never
+  drives mj_data->ctrl; it never actuates the MJCF's own position
+  actuators at all. A "position" command interface with no _pid suffix
+  instead directly overwrites mj_data->qpos every cycle (a kinematic
+  teleport, verified live: it produced frozen position readback with
+  large spurious velocity, and effort stayed pinned at 0, physics-free).
+  The effort interface writes mj_data->qfrc_applied, clamped in write() to
+  joint_limits.has_effort_limits/max_effort sourced straight from this
+  URDF's limit-effort attribute (i.e. the real FR3 87/12 N-m limits); this
+  is the one path that genuinely respects real torque limits during MuJoCo
+  execution, matching Phase 1's actual goal. The JTC-internal PID that
+  turns tracked position error into this effort command uses the same
+  gains as the real robot's own franka_ros2/franka_fr3_moveit_config
+  fr3_ros_controllers.yaml (see config/fr3_ros_controllers.yaml here).
+-->
+<robot name="fr3" xmlns:xacro="http://www.ros.org/wiki/xacro">
+
+  <xacro:include filename="$(find franka_description)/robots/fr3/fr3.urdf.xacro"/>
+
+  <!-- Phase 4b: end-effector payload. fr3_link8 (franka_description's own
+       virtual flange link, franka_robot.xacro) is at the SAME physical
+       offset MuJoCo's own attachment_site uses on fr3_link7 (both come
+       from Franka's own kinematics spec); attaching here with a zero
+       origin keeps both models' payload at the identical point.
+
+       This link's mass must genuinely be part of fr3_dynamics's own KDL
+       chain (root_link to tip_link) for B2/B3's certificate to see it at
+       all; adding the MJCF body alone (as an earlier pass in this phase
+       did) changes only the SIMULATED physics, not what the certificate
+       itself computes, since fr3_dynamics parses THIS URDF via
+       kdl_parser, entirely independently of the MJCF. b2.tip_link and
+       b3.tip_link must be set to "payload" (not "fr3_link8") for this
+       link's mass to actually enter the chain; see the b2/b3 config
+       YAMLs. 1e-6 kg is the same numerically-safe near-zero default
+       fr3.xml's own payload body and the Python reference's
+       Arm.set_payload_mass use, not a real physical claim. -->
+  <xacro:arg name="payload_mass" default="1e-6"/>
+  <link name="payload">
+    <inertial>
+      <mass value="$(arg payload_mass)"/>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <inertia ixx="1e-8" iyy="1e-8" izz="1e-8" ixy="0" ixz="0" iyz="0"/>
+    </inertial>
+  </link>
+  <joint name="payload_joint" type="fixed">
+    <parent link="fr3_link8"/>
+    <child link="payload"/>
+    <origin xyz="0 0 0" rpy="0 0 0"/>
+  </joint>
+
+  <ros2_control name="MujocoSystem" type="system">
+    <hardware>
+      <plugin>mujoco_ros2_control/MujocoSystem</plugin>
+    </hardware>
+
+    <joint name="fr3_joint1">
+      <command_interface name="effort"/>
+      <state_interface name="position"><param name="initial_value">0.0</param></state_interface>
+      <state_interface name="velocity"/>
+      <state_interface name="effort"/>
+    </joint>
+    <joint name="fr3_joint2">
+      <command_interface name="effort"/>
+      <state_interface name="position"><param name="initial_value">-0.7853981633974483</param></state_interface>
+      <state_interface name="velocity"/>
+      <state_interface name="effort"/>
+    </joint>
+    <joint name="fr3_joint3">
+      <command_interface name="effort"/>
+      <state_interface name="position"><param name="initial_value">0.0</param></state_interface>
+      <state_interface name="velocity"/>
+      <state_interface name="effort"/>
+    </joint>
+    <joint name="fr3_joint4">
+      <command_interface name="effort"/>
+      <state_interface name="position"><param name="initial_value">-2.356194490192345</param></state_interface>
+      <state_interface name="velocity"/>
+      <state_interface name="effort"/>
+    </joint>
+    <joint name="fr3_joint5">
+      <command_interface name="effort"/>
+      <state_interface name="position"><param name="initial_value">0.0</param></state_interface>
+      <state_interface name="velocity"/>
+      <state_interface name="effort"/>
+    </joint>
+    <joint name="fr3_joint6">
+      <command_interface name="effort"/>
+      <state_interface name="position"><param name="initial_value">1.5707963267948966</param></state_interface>
+      <state_interface name="velocity"/>
+      <state_interface name="effort"/>
+    </joint>
+    <joint name="fr3_joint7">
+      <command_interface name="effort"/>
+      <state_interface name="position"><param name="initial_value">0.7853981633974483</param></state_interface>
+      <state_interface name="velocity"/>
+      <state_interface name="effort"/>
+    </joint>
+  </ros2_control>
+
+</robot>
