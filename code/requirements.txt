@@ -1,0 +1,28 @@
+# Dependencies for the verification code in this directory.
+#
+# Lower bounds rather than pins: the test suite checks CORRECTNESS PROPERTIES
+# (mass-matrix symmetry, a closed-form gravity-torque check, a finite-difference
+# Jacobian check, the brake recursion's shift and finite-rest properties, and
+# X_f's positive invariance), not reproduction of the paper's reported figures,
+# so it should not break on a routine dependency bump -- and if it ever does,
+# that is a finding worth seeing rather than something to pin away.
+#
+# The paper's NUMERIC claims are a different matter: Sec. IX's figures and the
+# Theorem 4/5/Proposition 6 numbers in Sec. VI were produced with the exact
+# versions recorded below, on Python 3.11. Re-verify against these before
+# treating any regenerated number as a discrepancy.
+#
+#   mujoco==3.12.0  numpy==2.4.6  cvxpy==1.9.2
+#   osqp==1.1.3     scs==3.2.11   pytest==9.1.1
+#
+# osqp and scs are listed explicitly even though cvxpy pulls them in: the
+# Level-2 reshape QP asks for both BY NAME (local_planner.py solves with
+# cp.OSQP and falls back to cp.SCS when OSQP hits its iteration limit on the
+# whole-route problem), so neither is an optional transitive dependency here.
+
+mujoco>=3.2
+numpy>=1.26
+cvxpy>=1.5
+osqp>=0.6.3
+scs>=3.2
+pytest>=7.4
