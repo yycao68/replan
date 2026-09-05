@@ -159,19 +159,32 @@ def test_reroute_switches_to_alt_route_when_primary_infeasible():
     assert route.level == 3, f"expected the easy alt route to be accepted, got level {route.level}"
 
 
-def test_route_level_reshape_restores_feasibility_when_retiming_cannot():
-    """Positive case for _search_reshape_whole_route (Level 2 tried at ROUTE-
-    PLANNING time, not just online): a route through a known, position-
-    triggered force field (as in Exp 7) where retiming genuinely cannot help
-    (the deficit does not shrink with speed) but reshaping can, by
-    reallocating velocity/timing WITHIN the same total duration rather than
-    routing around the field entirely (confirmed directly: the reshaped
-    route's minimum end-effector height is not shallower than the nominal
-    route's -- it still enters the field, just moves through it differently).
-    This is the one scenario in the current suite that exercises a
-    *successful* route-level Level-2 outcome, closing the coverage gap
-    flagged when the reshape objective was corrected to penalize deviation
-    from the nominal trajectory (see README)."""
+def test_route_level_reshape_does_not_falsely_pass_a_position_dependent_force_field():
+    """Formerly asserted the OPPOSITE outcome (route.level == 2, "reshape
+    succeeds") and was cited in the paper (Sec. IX-H) as m_phys=2.55 -- a real
+    bug, found and fixed, not a paper wording issue. _search_reshape_whole_
+    route (and online_step's Level-2 branch) sampled the contact force ONCE,
+    from the NOMINAL trajectory's positions, then reused that stale array for
+    the post-hoc cert.m_phys(Q_new, ...) re-verification of the RESHAPED
+    trajectory. Because this contact force is position-dependent, and the
+    reshaped path here dips deeper into the field than the nominal one
+    (ee_z=0.144 vs. 0.234, contact plane at z=0.55) -- something the paper's
+    own text already noted geometrically ("the reshaped path's minimum
+    end-effector height is, if anything, slightly lower") without recognizing
+    it invalidated the force used in the feasibility check -- the certificate
+    check ran against a nominal-position force of 94.7N when the reshaped
+    path's true force there is 121.7N. Independently recomputing the margin
+    with forces resampled at the reshaped positions gives m_phys=-0.14, not
+    the reported +2.55. Fixed in local_planner.py by resampling forces at the
+    QP's returned Qn before the certificate check, in both call sites. Once
+    fixed, this specific scenario no longer demonstrates a genuine route-level
+    reshape success -- it now correctly falls through to level 0 (retiming and
+    reshaping both fail; a real deployment would need allow_level3=True to
+    reroute, as Exp 7's structurally identical case already does). No
+    scenario in this benchmark currently demonstrates a genuine route-level
+    reshape success under a position-dependent force field; this test now
+    guards against the false-positive silently coming back, not against a
+    regression in a real capability."""
     Z_CONTACT = 0.55
     K_CONTACT = 300.0
 
@@ -197,10 +210,14 @@ def test_route_level_reshape_restores_feasibility_when_retiming_cannot():
     route = planner.plan_route(traj, ee_force_fn=contact_force)
     print(f"route-level reshape test: level={route.level}, m_phys={route.m_phys:.2f}")
     assert route.triggered
-    assert route.level == 2, f"expected route-level reshape to succeed, got level {route.level}"
-    assert route.m_phys >= cert.m_safe - 1e-6
-    assert np.allclose(route.traj.q0, q0, atol=1e-3)
-    assert np.allclose(route.traj.qf, qf, atol=1e-3), "reshape must reach the SAME goal"
+    assert route.level == 0, (
+        f"reshape should NOT report success on this scenario (got level "
+        f"{route.level}) -- if this starts asserting level==2 again, verify "
+        f"with an independent recomputation (forces resampled at route.traj's "
+        f"actual Q, not the nominal trajectory's) before trusting it, since "
+        f"this is exactly the false-positive this test guards against"
+    )
+    assert route.m_phys < cert.m_safe, "the true, force-consistent margin here is negative"
 
 
 def test_closed_form_retiming_rescues_a_genuinely_dynamic_nonmonotonic_scenario():

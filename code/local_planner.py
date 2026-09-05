@@ -414,7 +414,17 @@ class LocalPlanner:
         if reshaped is None:
             return None
         Qn, Qdotn, Qddotn = reshaped
-        m2 = self.cert.m_phys(Qn, Qdotn, Qddotn, forces)
+        # Re-sample forces AT THE RESHAPED POSITIONS, not the nominal ones
+        # `forces` above was computed from -- a position-dependent force
+        # (e.g. contact) can differ substantially once the QP has moved the
+        # path, and cert.m_phys must be checked against the force the
+        # trajectory would ACTUALLY experience at Qn, not a stale value from
+        # before the reshape (found via direct disagreement with the Sec.
+        # IX-H scenario: reported m_phys=2.55 using stale forces, true
+        # m_phys=-0.14 once contact force is resampled at the reshaped,
+        # deeper-penetrating path -- see README.md).
+        forces_new = self._sample_forces(ts, Qn, ee_force_fn)
+        m2 = self.cert.m_phys(Qn, Qdotn, Qddotn, forces_new)
         if m2 < self.cert.m_safe:
             return None
         return SampledTrajectory(ts, Qn, Qdotn, Qddotn), m2
@@ -482,7 +492,11 @@ class LocalPlanner:
             reshaped = self._try_reshape(Q, Qdot, Qddot, forces)
             if reshaped is not None:
                 Qn, Qdotn, Qddot2 = reshaped
-                m2 = self.cert.m_phys(Qn, Qdotn, Qddot2, forces)
+                # See _search_reshape_whole_route's identical fix: forces must
+                # be resampled at the reshaped positions Qn, not reused from
+                # the nominal Q they were sampled at above.
+                forces_new = self._sample_forces(ts, Qn, ee_force_fn)
+                m2 = self.cert.m_phys(Qn, Qdotn, Qddot2, forces_new)
                 if m2 >= self.cert.m_safe:
                     return PlanResult(2, Qn, Qdotn, Qddot2, m0, m2, triggered=True)
                 best_effort = (Qn, Qdotn, Qddot2, m2)  # didn't fully restore margin,
