@@ -110,9 +110,25 @@ def _envs(z_band=0.01, k_frac=0.10, wc_z=(0.45, 0.70), wc_k=(0.0, 900.0)):
 # interval [s_lo, s_hi] attained at the box's corners, and |tau_i(s)| -- a
 # modulus of an affine function -- attains its supremum on that interval at an
 # endpoint. Two inverse-dynamics evaluations therefore give the EXACT per-joint
-# supremum, so this implementation realizes P2 Theorem 1(ii)'s tightness rather
-# than approximating it: the worst case reported is achieved by an environment
-# genuinely admissible under the box.
+# supremum over the box: the worst case reported is achieved by an environment
+# genuinely admissible under it, with no sampling error.
+#
+# THAT IS NOT THE SAME AS P2 Theorem 1(ii)'s tightness, and an earlier version of
+# this comment claimed it was. Theorem 1(ii) says the margin test is exact
+# relative to (H_E, eps_R), with eps_R the ROBOT-model error alone -- P2 carries
+# environment uncertainty in the set H_E, not in eps_R. This code subtracts
+# `cert.delta_tau`, which is P1's bound and covers "model mismatch AND
+# contact/disturbance prediction error" (P1 Sec. IV). Using it as eps_R
+# therefore DOUBLE-COUNTS environment-prediction error that the sup over the box
+# already accounts for, so the margin here is strictly more conservative than
+# P2 Def. 2 requires: the test is sound but not tight.
+#
+# The conflation is kept for continuity with P1's numbers rather than silently
+# corrected, because P1 never decomposed delta_tau into a robot part and an
+# environment part, so any split would be invented here. Its consequences are
+# one-directional (everything is more conservative, nothing is unsafe) and are
+# measured rather than argued: part C2 sweeps eps_R and reports how far the
+# rho > beta threshold moves.
 # ----------------------------------------------------------------------
 def force_scalar_range(arm, q, box: EnvBox):
     ee_z = arm.ee_position(q)[1]
@@ -124,7 +140,13 @@ def force_scalar(arm, q, z, k):
     return k * max(0.0, z - arm.ee_position(q)[1])
 
 
-def beta_at(arm, cert, q, box: EnvBox, z_nom, k_nom):
+def eps_R(cert, scale=1.0):
+    """P2's robot-model error bound. Defaults to P1's delta_tau; see the header
+    comment for why that over-counts, and part C2 for how much it costs."""
+    return scale * cert.delta_tau
+
+
+def beta_at(arm, cert, q, box: EnvBox, z_nom, k_nom, eps_scale=1.0):
     """P2 Def. 5's detection threshold at one state: the largest torque discrepancy
     the hypothesis itself can explain, plus the robot-model error bound. A residual
     above this cannot be accounted for by any environment the hypothesis admits."""
@@ -132,10 +154,10 @@ def beta_at(arm, cert, q, box: EnvBox, z_nom, k_nom):
     s_nom = force_scalar(arm, q, z_nom, k_nom)
     jz = np.abs(arm.jacobian(q)[1, :])
     swing = max(abs(s_hi - s_nom), abs(s_nom - s_lo))
-    return float(np.max(jz * swing) + np.max(cert.delta_tau))
+    return float(np.max(jz * swing) + np.max(eps_R(cert, eps_scale)))
 
 
-def worst_case_margins(arm, cert, Q, Qdot, Qddot, box: EnvBox):
+def worst_case_margins(arm, cert, Q, Qdot, Qddot, box: EnvBox, eps_scale=1.0):
     """(n_steps, n_joints) array of tau_max - sup_{e in box}|tau_req,i| - delta_tau."""
     n_steps = Q.shape[0]
     m = np.zeros((n_steps, N_JOINTS))
@@ -144,13 +166,13 @@ def worst_case_margins(arm, cert, Q, Qdot, Qddot, box: EnvBox):
         jz = arm.jacobian(Q[j])[1, :]
         s_lo, s_hi = force_scalar_range(arm, Q[j], box)
         worst = np.maximum(np.abs(tau_id - jz * s_lo), np.abs(tau_id - jz * s_hi))
-        m[j, :] = TAU_MAX - worst - cert.delta_tau
+        m[j, :] = TAU_MAX - worst - eps_R(cert, eps_scale)
     return m
 
 
-def rho(arm, cert, Q, Qdot, Qddot, box: EnvBox):
+def rho(arm, cert, Q, Qdot, Qddot, box: EnvBox, eps_scale=1.0):
     """P2 Def. 2: the realizability margin of a trajectory under an environment set."""
-    return float(worst_case_margins(arm, cert, Q, Qdot, Qddot, box).min())
+    return float(worst_case_margins(arm, cert, Q, Qdot, Qddot, box, eps_scale).min())
 
 
 def _r_of(qdot):
@@ -355,7 +377,37 @@ def part_c2(payload=1.0, via_q1=0.46, dz=0.07,
         print(f"   {band:8.3f} {b_at_det:7.2f} {r:7.2f} {str(r > b_at_det):>9} "
               f"{td:7.3f} {tw:9.3f} {pred:15.3f}")
         out[band] = (b_at_det, r, td, tw, pred)
-    print("   rho is the H_E margin banked over the plan from onset onward.")
+    print("\n   eps_R sensitivity: this module uses P1's delta_tau as eps_R, which also")
+    print("   carries environment-prediction error the sup over H_E already covers (see the")
+    print("   header comment). Sweeping the scale shows how much of the tight-hypothesis")
+    print("   requirement above is that over-count rather than physics:")
+    print(f"   {'eps_R':>12} {'z band for rho>beta':>21} {'beta':>7} {'rho':>7} {'pred T_w':>9}")
+    for esc in (1.0, 0.5, 0.25, 0.0):
+        crossed = None
+        for band in (0.100, 0.050, 0.020, 0.010, 0.005, 0.002):
+            h = EnvBox(Z_ASSERTED - band, Z_ASSERTED + band,
+                       K_ASSERTED * 0.9, K_ASSERTED * 1.1, "H_E")
+            bt = np.array([beta_at(arm, cert, Q[j], h, Z_ASSERTED, K_ASSERTED, esc)
+                           for j in range(len(ts))])
+            r = rho(arm, cert, Q[i0:], Qd[i0:], Qdd[i0:], h, esc)
+            fired = np.flatnonzero(dev > bt)
+            fired = fired[fired >= i0]
+            b = float(bt[fired[0]]) if fired.size else float(bt[i0])
+            if r > b:
+                crossed = (band, b, r, (r - b) / L)
+                break
+        lbl = f"{esc:.2f} x dtau"
+        if crossed:
+            band, b, r, pw = crossed
+            print(f"   {lbl:>12} {band:21.3f} {b:7.2f} {r:7.2f} {pw:9.3f}")
+        else:
+            print(f"   {lbl:>12} {'none in sweep':>21} {'':>7} {'':>7} {'':>9}")
+    print("   The 0.00 row is the limit in which eps_R is dropped entirely and H_E alone")
+    print("   carries the uncertainty, i.e. P2 Def. 2 read literally. The gap between it")
+    print("   and the 1.00 row is the cost of P1's bundled bound, and it is the honest")
+    print("   caveat on the tight-hypothesis conclusion above.")
+
+    print("\n   rho is the H_E margin banked over the plan from onset onward.")
     print("   Read the last two columns together: the prediction is a GUARANTEED LOWER")
     print("   BOUND, so pred <= meas is the theorem holding, and a negative pred means")
     print("   no guarantee is available at that hypothesis width -- not a refutation.")
