@@ -26,6 +26,11 @@ ros2_ws/src/fr3_mujoco_bringup/mujoco_models/
 # Staged MuJoCo SDK (Phase 0/1 infra work) -- large build artifacts.
 mujoco_sdk/
 
+# Standalone companion benchmark repo (yycao68/predictive-realizability),
+# published separately so it's citable independent of this paper repo --
+# has its own git history/remote, not tracked here.
+predictive-realizability/
+
 # Downloaded reference PDFs for citation verification -- third-party
 # copyrighted papers, not repo content.
 *.pdf
